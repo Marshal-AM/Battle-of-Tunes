@@ -3,7 +3,7 @@ import requests
 import telebot
 
 # Replace with your actual configurations
-BOT_TOKEN = '8129215983:AAEeGuv6KUWyXXPfRI1CRTSjqd2WOxgWKCY'
+BOT_TOKEN = '****************'
 MUSIC_MODEL_API = 'https://da2d-34-124-198-76.ngrok-free.app/generate-music'
 SUBMISSION_CHAT_ID = '-4701503942'  # The chat where audio will be automatically submitted
 
