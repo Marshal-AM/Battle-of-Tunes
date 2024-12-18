@@ -1,11 +1,11 @@
 import os
-import telebot
 import requests
+import telebot
 
 # Replace with your actual configurations
-BOT_TOKEN = '********************************'
-MUSIC_MODEL_API = 'https://284b-34-87-105-198.ngrok-free.app/generate-music'
-SUBMISSION_CHAT_ID = '@F69696'  # The chat where audio will be automatically submitted
+BOT_TOKEN = '8129215983:AAEeGuv6KUWyXXPfRI1CRTSjqd2WOxgWKCY'
+MUSIC_MODEL_API = 'https://da2d-34-124-198-76.ngrok-free.app/generate-music'
+SUBMISSION_CHAT_ID = '-4701503942'  # The chat where audio will be automatically submitted
 
 # Initialize the Telegram Bot
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -13,6 +13,40 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Store user states and last generated audio
 user_states = {}
 user_last_audio = {}
+
+def send_audio_via_telegram_api(bot_token, chat_id, audio_file_path):
+    """Send audio file using Telegram Bot API POST request"""
+    url = f"https://api.telegram.org/bot{bot_token}/sendAudio"
+
+    # Prepare the files and data for the request
+    files = {
+        'audio': open(audio_file_path, 'rb')
+    }
+
+    data = {
+        'chat_id': chat_id,
+        'title': 'Generated Music',
+        'performer': 'AI Music Generator'
+    }
+
+    try:
+        # Send the POST request
+        response = requests.post(url, files=files, data=data)
+
+        # Check the response
+        response_json = response.json()
+
+        if response.status_code == 200 and response_json.get('ok'):
+            print("Audio sent successfully!")
+            return response_json
+        else:
+            print("Failed to send audio")
+            print(response_json)
+            return None
+
+    except Exception as e:
+        print(f"Error sending audio: {e}")
+        return None
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -65,35 +99,38 @@ def generate_music(message):
             with open(audio_file_path, 'wb') as f:
                 f.write(response.content)
 
-            # Store the audio file path for potential submission
-            user_last_audio[message.chat.id] = audio_file_path
-
-            # Send the audio file
-            with open(audio_file_path, 'rb') as audio:
-                bot.send_audio(
-                    message.chat.id,
-                    audio = audio,
-                    title='Generated Music',
-                    performer='AI Music Generator'
-                )
+            # Send the audio file using Telegram Bot API POST request
+            send_result = send_audio_via_telegram_api(
+                bot_token=BOT_TOKEN,
+                chat_id=message.chat.id,
+                audio_file_path=audio_file_path
+            )
 
             # Delete the waiting message
             bot.delete_message(message.chat.id, waiting_message.message_id)
 
-            # Ask for satisfaction with submit option
-            satisfaction_markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
-            submit_button = telebot.types.KeyboardButton('Submit')
-            no_button = telebot.types.KeyboardButton('No')
-            satisfaction_markup.add(submit_button, no_button)
+            if send_result:
+                # Store the audio file path for potential submission
+                user_last_audio[message.chat.id] = audio_file_path
 
-            bot.send_message(
-                message.chat.id,
-                "Do you want to submit this audio or generate a new one?",
-                reply_markup=satisfaction_markup
-            )
+                # Ask for satisfaction with submit option
+                satisfaction_markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
+                submit_button = telebot.types.KeyboardButton('Submit')
+                no_button = telebot.types.KeyboardButton('No')
+                satisfaction_markup.add(submit_button, no_button)
 
-            # Update user state
-            user_states[message.chat.id] = 'awaiting_satisfaction'
+                bot.send_message(
+                    message.chat.id,
+                    "Do you want to submit this audio or generate a new one?",
+                    reply_markup=satisfaction_markup
+                )
+
+                # Update user state
+                user_states[message.chat.id] = 'awaiting_satisfaction'
+            else:
+                # Handle send audio failure
+                bot.reply_to(message, "Failed to send the generated audio.")
+                user_states[message.chat.id] = None
 
         else:
             # Handle API error
@@ -118,19 +155,25 @@ def handle_satisfaction(message):
         # Submit the audio to the specified chat
         if message.chat.id in user_last_audio:
             try:
-                with open(user_last_audio[message.chat.id], 'rb') as audio:
-                    bot.send_audio(
-                        SUBMISSION_CHAT_ID,
-                        audio,
-                        title='Submitted Music',
-                        performer='AI Music Generator Submission'
-                    )
-
-                bot.send_message(
-                    message.chat.id,
-                    "Audio successfully submitted! 🎵",
-                    reply_markup=telebot.types.ReplyKeyboardRemove()
+                # Use Telegram API POST request to submit audio
+                submit_result = send_audio_via_telegram_api(
+                    bot_token=BOT_TOKEN,
+                    chat_id=SUBMISSION_CHAT_ID,
+                    audio_file_path=user_last_audio[message.chat.id]
                 )
+
+                if submit_result:
+                    bot.send_message(
+                        message.chat.id,
+                        "Audio successfully submitted! 🎵",
+                        reply_markup=telebot.types.ReplyKeyboardRemove()
+                    )
+                else:
+                    bot.send_message(
+                        message.chat.id,
+                        "Submission failed.",
+                        reply_markup=telebot.types.ReplyKeyboardRemove()
+                    )
 
                 # Clean up the audio file
                 os.remove(user_last_audio[message.chat.id])
@@ -180,5 +223,5 @@ def main():
     print("Bot is running...")
     bot.polling(none_stop=True)
 
-if _name_ == '_main_':
+if __name__ == '__main__':
     main()
