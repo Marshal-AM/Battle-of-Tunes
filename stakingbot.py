@@ -342,7 +342,7 @@ class SongBattleBot:
 
 if __name__ == '__main__':
     # Replace with your actual Telegram bot token
-    TOKEN = '7523356428:AAGyzsCd572yfNp2MmW5y5-JIaco--NEGDg'
+    TOKEN = '************************'
 
     # Ensure audio submissions directory exists
     os.makedirs('audio_submissions', exist_ok=True)
