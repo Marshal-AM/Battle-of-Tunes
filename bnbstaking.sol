@@ -1,15 +1,16 @@
 /**
- *Submitted for verification at testnet.bscscan.com on 2024-12-16
+ *Submitted for verification at testnet.bscscan.com on 2024-12-23
 */
 
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.16;
 
-contract bnbfinal {
+contract corestaking {
     uint256 public constant STAKE_AMOUNT = 0.0002 ether;
     address public owner;
     
-    // Remove the hasStaked mapping
+    // Add the hasStaked mapping
+    mapping(address => bool) public hasStaked;
     
     event Staked(address indexed user, uint256 amount);
     event FundsSent(address indexed recipient, uint256 amount);
@@ -25,13 +26,16 @@ contract bnbfinal {
     
     function stake() public payable {
         require(msg.value == STAKE_AMOUNT, "You must stake exactly 0.0002 BNB");
-        // Remove the check for previous staking
+        require(!hasStaked[msg.sender], "You have already staked");
         
-        // No need to track previous stakes
+        hasStaked[msg.sender] = true;
         emit Staked(msg.sender, msg.value);
     }
     
-    // Remove the verifyStake function as it's no longer needed
+    // Add the verifyStake function
+    function verifyStake(address user) public view returns (bool) {
+        return hasStaked[user];
+    }
     
     function withdraw() public onlyOwner {
         payable(owner).transfer(address(this).balance);
