@@ -4,48 +4,31 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes
-)
+import telebot
+from telebot.handler_backends import State, StatesGroup
+from telebot.storage import StateMemoryStorage
 import aiohttp
 
 # Logging setup
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Constants for conversation states
-WAITING_WALLET = 1
+AUDIO_GEN_BOT_USERNAME = "@YourAudioGenBot"  # Replace with actual audio generation bot username
 
 class ParticipantsDatabase:
     def __init__(self, db_path='song_battle_participants.db'):
-        """
-        Initialize the database with participant tracking for group battles.
-        
-        Args:
-            db_path (str): Path to the SQLite database file
-        """
         self.db_path = db_path
         self._lock = threading.Lock()
         self._init_database()
 
     def _init_database(self):
-        """
-        Create the database tables if they don't exist.
-        """
+        """Create the database tables if they don't exist."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
-        # Participants table with group-specific fields
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS participants (
                 user_id INTEGER,
@@ -59,66 +42,66 @@ class ParticipantsDatabase:
                 PRIMARY KEY (user_id, chat_id)
             )
         ''')
-        
+
         conn.commit()
         conn.close()
 
-    def add_participant(self, user_id, username, wallet_address, chat_id):
-        """
-        Add a participant to the database for a specific group battle.
-        
-        Args:
-            user_id (int): Telegram user ID
-            username (str): Telegram username
-            wallet_address (str): User's wallet address
-            chat_id (int): Group chat ID
-        """
+    def get_all_inactive_participants(self):
+        """Get all participants who aren't in an active battle"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
-                # Remove any existing entries for this user in the current group
                 cursor.execute('''
-                    DELETE FROM participants 
-                    WHERE user_id = ? AND chat_id = ?
-                ''', (user_id, chat_id))
-                
-                # Insert new participant entry
-                cursor.execute('''
-                    INSERT INTO participants 
-                    (user_id, username, wallet_address, chat_id, verified, battle_start_timestamp, battle_active) 
-                    VALUES (?, ?, ?, ?, 1, datetime('now'), 1)
-                ''', (user_id, username, wallet_address, chat_id))
-                
-                conn.commit()
+                    SELECT user_id, username, wallet_address, chat_id
+                    FROM participants
+                    WHERE battle_active = 0
+                    ORDER BY battle_start_timestamp DESC NULLS LAST
+                ''')
+                return cursor.fetchall()
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
+                return []
+            finally:
+                conn.close()
+
+    def activate_battle_for_users(self, user_ids, chat_id):
+        """Activate battle for specified users in a chat"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            try:
+                cursor.execute('''
+                    UPDATE participants
+                    SET battle_active = 1,
+                        battle_start_timestamp = datetime('now')
+                    WHERE user_id IN ({}) AND chat_id = ?
+                '''.format(','.join('?' * len(user_ids))), (*user_ids, chat_id))
+
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logger.error(f"Database error: {e}")
+                return False
             finally:
                 conn.close()
 
     def get_participants(self, chat_id):
-        """
-        Retrieve active participants for a specific group.
-        
-        Args:
-            chat_id (int): Group chat ID
-        
-        Returns:
-            dict: Dictionary of active participants
-        """
+        """Get active participants for a specific group"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
                 cursor.execute('''
-                    SELECT user_id, username, wallet_address, audio_file 
-                    FROM participants 
+                    SELECT user_id, username, wallet_address, audio_file
+                    FROM participants
                     WHERE chat_id = ? AND battle_active = 1
                 ''', (chat_id,))
                 results = cursor.fetchall()
-                
+
                 participants = {}
                 for result in results:
                     participants[result[0]] = {
@@ -126,7 +109,7 @@ class ParticipantsDatabase:
                         'wallet_address': result[2],
                         'audio_file': result[3]
                     }
-                
+
                 return participants
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
@@ -135,24 +118,15 @@ class ParticipantsDatabase:
                 conn.close()
 
     def check_user_in_battle(self, user_id, chat_id):
-        """
-        Check if a user is already in an active battle for a specific group.
-        
-        Args:
-            user_id (int): Telegram user ID
-            chat_id (int): Group chat ID
-        
-        Returns:
-            bool: True if user is in an active battle, False otherwise
-        """
+        """Check if user is in active battle"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
                 cursor.execute('''
-                    SELECT COUNT(*) 
-                    FROM participants 
+                    SELECT COUNT(*)
+                    FROM participants
                     WHERE user_id = ? AND chat_id = ? AND battle_active = 1
                 ''', (user_id, chat_id))
                 result = cursor.fetchone()
@@ -163,55 +137,19 @@ class ParticipantsDatabase:
             finally:
                 conn.close()
 
-    def update_participant_audio(self, user_id, chat_id, audio_file):
-        """
-        Update the audio file for a participant in a specific group battle.
-        
-        Args:
-            user_id (int): Telegram user ID
-            chat_id (int): Group chat ID
-            audio_file (str): Path to the audio file
-        """
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            try:
-                cursor.execute('''
-                    UPDATE participants 
-                    SET audio_file = ? 
-                    WHERE user_id = ? AND chat_id = ? AND battle_active = 1
-                ''', (audio_file, user_id, chat_id))
-                conn.commit()
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-            finally:
-                conn.close()
-
     def check_all_participants_submitted(self, chat_id):
-        """
-        Check if all participants in a group have submitted audio files.
-        
-        Args:
-            chat_id (int): Group chat ID
-        
-        Returns:
-            bool: True if all participants have submitted, False otherwise
-        """
+        """Check if all participants have submitted audio"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
-                # Check if all participants have a non-None audio file
                 cursor.execute('''
-                    SELECT COUNT(*) 
-                    FROM participants 
+                    SELECT COUNT(*)
+                    FROM participants
                     WHERE chat_id = ? AND battle_active = 1 AND audio_file IS NULL
                 ''', (chat_id,))
                 result = cursor.fetchone()
-                
-                # If count is 0, all participants have submitted
                 return result[0] == 0
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
@@ -220,23 +158,15 @@ class ParticipantsDatabase:
                 conn.close()
 
     def get_participants_for_submission(self, chat_id):
-        """
-        Get participants with their audio files for submission in a specific group.
-        
-        Args:
-            chat_id (int): Group chat ID
-        
-        Returns:
-            list: List of participants with audio files
-        """
+        """Get participants with their audio files"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
                 cursor.execute('''
-                    SELECT wallet_address, audio_file 
-                    FROM participants 
+                    SELECT wallet_address, audio_file
+                    FROM participants
                     WHERE chat_id = ? AND battle_active = 1 AND audio_file IS NOT NULL
                 ''', (chat_id,))
                 return [
@@ -253,21 +183,17 @@ class ParticipantsDatabase:
                 conn.close()
 
     def reset_battle(self, chat_id):
-        """
-        Reset the battle state for a specific group.
-        
-        Args:
-            chat_id (int): Group chat ID
-        """
+        """Reset battle state for a group"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             try:
-                # Update participants to reset battle state for specific group
                 cursor.execute('''
-                    UPDATE participants 
-                    SET battle_active = 0, audio_file = NULL, battle_start_timestamp = NULL
+                    UPDATE participants
+                    SET battle_active = 0,
+                        audio_file = NULL,
+                        battle_start_timestamp = NULL
                     WHERE chat_id = ?
                 ''', (chat_id,))
                 conn.commit()
@@ -279,188 +205,149 @@ class ParticipantsDatabase:
 class SongBattleBot:
     def __init__(self, token):
         self.token = token
+        self.bot = telebot.TeleBot(token, state_storage=StateMemoryStorage())
         self.participants_db = ParticipantsDatabase()
-        self.evaluation_tasks = {}  # Track evaluation tasks per group
+        self.evaluation_tasks = {}
+        self.active_battles = set()
+        self.setup_handlers()
 
-    async def start_battle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handler for /startbattle command in a group"""
-        chat = update.effective_chat
-        user = update.effective_user
+    def setup_handlers(self):
+        @self.bot.message_handler(commands=['gentrack'])
+        def handle_gentrack(message):
+            """Direct active participants to the audio generation bot"""
+            user_id = message.from_user.id
+            chat_id = message.chat.id
 
-        # Check if a battle is already active in this group
-        participants = self.participants_db.get_participants(chat.id)
-        if participants:
-            await update.message.reply_text(
-                "A battle is already active in this group. Wait for it to finish!"
+            if not self.participants_db.check_user_in_battle(user_id, chat_id):
+                self.bot.reply_to(
+                    message,
+                    "You are not currently participating in any active battles."
+                )
+                return
+
+            self.bot.reply_to(
+                message,
+                f"Please generate your track using {AUDIO_GEN_BOT_USERNAME}\n\n"
+                "Once your track is generated, it will be automatically included in the battle.\n"
+                "No need to submit it here - I'll check periodically for your generated track."
             )
-            return
 
-        await update.message.reply_text(
-            "🎵 Song Battle Started! 🎵\n"
-            "Participants, use /join to enter the battle!"
+    async def check_for_battles(self):
+        """Continuously check for potential battles"""
+        while True:
+            try:
+                all_participants = self.participants_db.get_all_inactive_participants()
+
+                chat_participants = {}
+                for user_id, username, wallet, chat_id in all_participants:
+                    if chat_id not in chat_participants:
+                        chat_participants[chat_id] = []
+                    chat_participants[chat_id].append((user_id, username, wallet))
+
+                for chat_id, participants in chat_participants.items():
+                    if chat_id in self.active_battles:
+                        continue
+
+                    if len(participants) >= 3:
+                        valid_participants = []
+                        for user_id, username, wallet in participants:
+                            try:
+                                member = self.bot.get_chat_member(chat_id, user_id)
+                                if member.status in ['member', 'administrator', 'creator']:
+                                    valid_participants.append((user_id, username, wallet))
+                            except telebot.apihelper.ApiTelegramException:
+                                continue
+
+                        if len(valid_participants) == 3:
+                            user_ids = [p[0] for p in valid_participants]
+                            if self.participants_db.activate_battle_for_users(user_ids, chat_id):
+                                self.active_battles.add(chat_id)
+                                await self.start_battle(chat_id, valid_participants)
+
+            except Exception as e:
+                logger.error(f"Error in battle checking: {e}")
+
+            await asyncio.sleep(30)
+
+    async def start_battle(self, chat_id, participants):
+        """Start a battle with the given participants"""
+        participant_mentions = ", ".join(f"@{username}" for _, username, _ in participants)
+        announcement = (
+            "🎵 Battle of Tunes has begun! 🎵\n\n"
+            f"Today's Contestants:\n{participant_mentions}\n\n"
+            "🎼 How to Generate Your Track:\n"
+            f"1. Head over to {AUDIO_GEN_BOT_USERNAME}\n"
+            "2. Generate your track using their interface\n"
+            "3. Your generated track will be automatically included in the battle\n\n"
+            "Need the generation link? Use the /gentrack command here\n\n"
+            "⏰ Important Notes:\n"
+            "• I'll check every 10 seconds for your generated tracks\n"
+            "• The battle will be evaluated once all tracks are received\n"
+            "• Don't submit tracks here - use only the generation bot\n\n"
+            "May the best tune win! 🎧"
+        )
+        self.bot.send_message(chat_id, announcement)
+
+        self.evaluation_tasks[chat_id] = asyncio.create_task(
+            self.monitor_battle_submissions(chat_id)
         )
 
-    async def join_battle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handler for /join command to enter the battle"""
-        chat = update.effective_chat
-        user = update.effective_user
-
-        # Check if a battle is active in this group
-        participants = self.participants_db.get_participants(chat.id)
-        if not participants:
-            await update.message.reply_text(
-                "No active battle. Start a battle first with /startbattle"
-            )
-            return
-
-        # Check if user is already in the battle
-        if self.participants_db.check_user_in_battle(user.id, chat.id):
-            await update.message.reply_text(
-                "You're already in this battle!"
-            )
-            return
-
-        # Prompt for wallet address
-        await update.message.reply_text(
-            f"{user.mention_markdown_v2()}, please provide your crypto wallet address."
-        )
-        return WAITING_WALLET
-
-    async def validate_wallet_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Validate and store wallet address for group battle"""
-        wallet_address = update.message.text.strip()
-        user = update.effective_user
-        chat = update.effective_chat
-
-        # Basic wallet address validation
-        if not wallet_address.startswith('0x') or len(wallet_address) != 42:
-            await update.message.reply_text(
-                "Invalid wallet address. Please provide a valid Ethereum wallet address."
-            )
-            return WAITING_WALLET
-
-        # Add participant to database for this group
-        self.participants_db.add_participant(
-            user_id=user.id,
-            username=user.username,
-            wallet_address=wallet_address,
-            chat_id=chat.id
-        )
-
-        # Start evaluation monitoring if not already started
-        if chat.id not in self.evaluation_tasks:
-            self.evaluation_tasks[chat.id] = asyncio.create_task(
-                self.monitor_battle_submissions(context, chat.id)
-            )
-
-        await update.message.reply_text(
-            f"Wallet address registered! {user.mention_markdown_v2()} is now in the battle. "
-            "Upload your audio track when ready!"
-        )
-        return ConversationHandler.END
-
-    async def receive_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle audio file submission in group"""
-        user = update.effective_user
-        chat = update.effective_chat
-        participants = self.participants_db.get_participants(chat.id)
-
-        # Check if user is a verified participant in this group's battle
-        if user.id not in participants:
-            await update.message.reply_text("You're not registered for this battle.")
-            return
-
-        # Download and save audio file
-        audio_file = await update.message.audio.get_file()
-        file_path = f"audio_submissions/{chat.id}_{user.id}_{audio_file.file_unique_id}.mp3"
-        await audio_file.download_to_drive(file_path)
-
-        # Update participant's audio file in database
-        self.participants_db.update_participant_audio(user.id, chat.id, file_path)
-
-        # Confirm audio submission
-        await update.message.reply_text(f"{user.mention_markdown_v2()} has submitted their track!")
-
-    async def monitor_battle_submissions(self, context, chat_id):
-        """
-        Monitor battle submissions with periodic checking for a specific group.
-        
-        Checks every 5 seconds if all participants have submitted.
-        Automatically submits to evaluation after 5 minutes.
-        """
+    async def monitor_battle_submissions(self, chat_id):
+        """Monitor battle submissions by checking database"""
         try:
             while True:
-                # Check if all participants have submitted
                 if self.participants_db.check_all_participants_submitted(chat_id):
-                    await self.submit_to_evaluation(context, chat_id)
+                    await self.submit_to_evaluation(chat_id)
                     return
-
-                # Wait 5 seconds before checking again
-                await asyncio.sleep(5)
-
-                # Check if 5 minutes have passed since battle start
-                # TODO: Implement timestamp check if needed
-        except asyncio.CancelledError:
-            # Task was cancelled
-            return
+                await asyncio.sleep(10)
         except Exception as e:
-            logger.error(f"Error in battle submission monitoring for group {chat_id}: {e}")
+            logger.error(f"Monitoring error for group {chat_id}: {e}")
+        finally:
+            if chat_id in self.active_battles:
+                self.active_battles.remove(chat_id)
 
-    async def submit_to_evaluation(self, context, chat_id):
-        """Submit audio files to evaluation API for a specific group"""
-        # Get participants with audio files
+    async def submit_to_evaluation(self, chat_id):
+        """Submit to evaluation API"""
         submissions = self.participants_db.get_participants_for_submission(chat_id)
-
-        # Prepare submission data
-        submission_data = {
-            'submissions': submissions
-        }
+        submission_data = {'submissions': submissions}
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post('https://your-evaluation-api.com/submit', json=submission_data) as response:
                     result = await response.json()
 
-            # Announce winner
             winner_wallet = result.get('winner_wallet')
             participants = self.participants_db.get_participants(chat_id)
-            
+
             winner = next(
                 (p for p in participants.values() if p['wallet_address'] == winner_wallet),
                 None
             )
 
-            if winner:
-                message = f"🏆 Battle Winner: @{winner['username']} (Wallet: {winner_wallet})"
-            else:
-                message = "No winner could be determined."
+            message = (f"🏆 Battle Winner: @{winner['username']} (Wallet: {winner_wallet})"
+                      if winner else "No winner could be determined.")
 
-            # Send winner announcement to the group
-            await context.bot.send_message(chat_id=chat_id, text=message)
+            self.bot.send_message(chat_id=chat_id, text=message)
 
-            # Reset battle state for this group
+            # Reset battle
             self.participants_db.reset_battle(chat_id)
             del self.evaluation_tasks[chat_id]
 
         except Exception as e:
-            logger.error(f"Evaluation submission error for group {chat_id}: {e}")
+            logger.error(f"Evaluation error for group {chat_id}: {e}")
 
-    def main(self):
-        """Set up and run the bot"""
-        application = Application.builder().token(self.token).build()
+    async def run(self):
+        """Run the bot with battle checking"""
+        logger.info("Starting bot...")
+        # Start the battle checker
+        asyncio.create_task(self.check_for_battles())
+        # Start the bot
+        await self.bot.polling(non_stop=True)
 
-        # Conversation handler for joining battle
-        join_battle_handler = ConversationHandler(
-            entry_points=[CommandHandler('join', self.join_battle)],
-            states={
-                WAITING_WALLET: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.validate_wallet_address)
-                ],
-            },
-            fallbacks=[]
-        )
+if __name__ == "__main__":
+    # Initialize and run bot
+    BOT_TOKEN = "*************************************"
+    bot = SongBattleBot(BOT_TOKEN)
 
-        # Add handlers
-        application.add_handler(CommandHandler('startbattle', self.start_battle))
-        application.add_handler(join_battle_handler)
-        application.add_handler
+    # Run the bot with asyncio
+    asyncio.run(bot.run())
