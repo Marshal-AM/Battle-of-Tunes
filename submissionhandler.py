@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 import telebot
+from telebot.async_telebot import AsyncTeleBot
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 import aiohttp
@@ -16,35 +17,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-AUDIO_GEN_BOT_USERNAME = "@YourAudioGenBot"  # Replace with actual audio generation bot username
+AUDIO_GEN_BOT_USERNAME = "@musicgen_051203_bot"  # Replace with actual audio generation bot username
 
 class ParticipantsDatabase:
-    def __init__(self, db_path='song_battle_participants.db'):
+    def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
         self.db_path = db_path
         self._lock = threading.Lock()
-        self._init_database()
+
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        # Initialize database with lock to prevent race conditions
+        with self._lock:
+            self._init_database()
 
     def _init_database(self):
         """Create the database tables if they don't exist."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS participants (
-                user_id INTEGER,
-                username TEXT,
-                wallet_address TEXT,
-                audio_file TEXT,
-                chat_id INTEGER,
-                verified BOOLEAN DEFAULT 1,
-                battle_start_timestamp DATETIME,
-                battle_active BOOLEAN DEFAULT 0,
-                PRIMARY KEY (user_id, chat_id)
-            )
-        ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS participants (
+                    user_id INTEGER,
+                    username TEXT,
+                    wallet_address TEXT,
+                    audio_file TEXT,
+                    chat_id INTEGER,
+                    verified BOOLEAN DEFAULT 1,
+                    battle_start_timestamp DATETIME,
+                    battle_active BOOLEAN DEFAULT 0,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+
+        except sqlite3.Error as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
 
     def get_all_inactive_participants(self):
         """Get all participants who aren't in an active battle"""
@@ -63,28 +78,6 @@ class ParticipantsDatabase:
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
                 return []
-            finally:
-                conn.close()
-
-    def activate_battle_for_users(self, user_ids, chat_id):
-        """Activate battle for specified users in a chat"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-
-            try:
-                cursor.execute('''
-                    UPDATE participants
-                    SET battle_active = 1,
-                        battle_start_timestamp = datetime('now')
-                    WHERE user_id IN ({}) AND chat_id = ?
-                '''.format(','.join('?' * len(user_ids))), (*user_ids, chat_id))
-
-                conn.commit()
-                return True
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return False
             finally:
                 conn.close()
 
@@ -114,6 +107,48 @@ class ParticipantsDatabase:
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
                 return {}
+            finally:
+                conn.close()
+
+    def get_all_participants_for_chat(self, chat_id):
+        """Get all participants (both active and inactive) for a specific group"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            try:
+                cursor.execute('''
+                    SELECT username, wallet_address, battle_active
+                    FROM participants
+                    WHERE chat_id = ?
+                    ORDER BY battle_active DESC, username
+                ''', (chat_id,))
+                return cursor.fetchall()
+            except sqlite3.Error as e:
+                logger.error(f"Database error: {e}")
+                return []
+            finally:
+                conn.close()
+
+    def activate_battle_for_users(self, user_ids, chat_id):
+        """Activate battle for specified users in a chat"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            try:
+                cursor.execute('''
+                    UPDATE participants
+                    SET battle_active = 1,
+                        battle_start_timestamp = datetime('now')
+                    WHERE user_id IN ({}) AND chat_id = ?
+                '''.format(','.join('?' * len(user_ids))), (*user_ids, chat_id))
+
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logger.error(f"Database error: {e}")
+                return False
             finally:
                 conn.close()
 
@@ -205,27 +240,67 @@ class ParticipantsDatabase:
 class SongBattleBot:
     def __init__(self, token):
         self.token = token
-        self.bot = telebot.TeleBot(token, state_storage=StateMemoryStorage())
+        self.bot = AsyncTeleBot(token, state_storage=StateMemoryStorage())
         self.participants_db = ParticipantsDatabase()
         self.evaluation_tasks = {}
         self.active_battles = set()
         self.setup_handlers()
 
     def setup_handlers(self):
+        @self.bot.message_handler(commands=['start'])
+        async def handle_start(message):
+            """Handle the /start command"""
+            welcome_text = (
+                "🎵 Welcome to Song Battle Bot! 🎵\n\n"
+                "I organize music creation battles where participants generate and compete with their AI-created tracks.\n\n"
+                "📜 How it works:\n"
+                "1. When there are 3 eligible participants, a battle automatically begins\n"
+                f"2. Participants use {AUDIO_GEN_BOT_USERNAME} to create their tracks\n"
+                "3. Once all tracks are submitted, they're evaluated and a winner is chosen\n\n"
+                "🎮 Commands:\n"
+                "/start - Show this information and current participants\n"
+                "/gentrack - Get the link to generate your track when in battle\n\n"
+            )
+
+            # Get current participants
+            participants = self.participants_db.get_all_participants_for_chat(message.chat.id)
+
+            if participants:
+                participant_text = "👥 Current Participants:\n\n"
+                active_participants = []
+                waiting_participants = []
+
+                for username, wallet, is_active in participants:
+                    user_info = f"@{username} (Wallet: {wallet[:6]}...{wallet[-4:]})"
+                    if is_active:
+                        active_participants.append(user_info + " 🎮")
+                    else:
+                        waiting_participants.append(user_info)
+
+                if active_participants:
+                    participant_text += "Active Battle:\n" + "\n".join(active_participants) + "\n\n"
+                if waiting_participants:
+                    participant_text += "Waiting for Battle:\n" + "\n".join(waiting_participants)
+            else:
+                participant_text = "👥 No participants registered yet!"
+
+            full_message = welcome_text + "\n" + participant_text
+            await self.bot.reply_to(message, full_message)
+
         @self.bot.message_handler(commands=['gentrack'])
-        def handle_gentrack(message):
+        async def handle_gentrack(message):
             """Direct active participants to the audio generation bot"""
             user_id = message.from_user.id
             chat_id = message.chat.id
 
             if not self.participants_db.check_user_in_battle(user_id, chat_id):
-                self.bot.reply_to(
+                await self.bot.reply_to(
                     message,
                     "You are not currently participating in any active battles."
                 )
                 return
 
-            self.bot.reply_to(
+            await self.bot.reply_to(
                 message,
                 f"Please generate your track using {AUDIO_GEN_BOT_USERNAME}\n\n"
                 "Once your track is generated, it will be automatically included in the battle.\n"
@@ -252,7 +327,7 @@ class SongBattleBot:
                         valid_participants = []
                         for user_id, username, wallet in participants:
                             try:
-                                member = self.bot.get_chat_member(chat_id, user_id)
+                                member = await self.bot.get_chat_member(chat_id, user_id)
                                 if member.status in ['member', 'administrator', 'creator']:
                                     valid_participants.append((user_id, username, wallet))
                             except telebot.apihelper.ApiTelegramException:
@@ -286,7 +361,7 @@ class SongBattleBot:
             "• Don't submit tracks here - use only the generation bot\n\n"
             "May the best tune win! 🎧"
         )
-        self.bot.send_message(chat_id, announcement)
+        await self.bot.send_message(chat_id, announcement)
 
         self.evaluation_tasks[chat_id] = asyncio.create_task(
             self.monitor_battle_submissions(chat_id)
@@ -307,27 +382,85 @@ class SongBattleBot:
                 self.active_battles.remove(chat_id)
 
     async def submit_to_evaluation(self, chat_id):
-        """Submit to evaluation API"""
+        """Submit to evaluation API using form-data format and display detailed results"""
         submissions = self.participants_db.get_participants_for_submission(chat_id)
-        submission_data = {'submissions': submissions}
 
         try:
+            # Prepare form data
+            form_data = aiohttp.FormData()
+
+            # Add audio files first (in order)
+            for idx, submission in enumerate(submissions):
+                audio_data = submission['audio_file']
+                form_data.add_field(f'audio_{idx + 1}',
+                                  audio_data,
+                                  filename=f'track{idx + 1}.mp3',
+                                  content_type='audio/mpeg')
+
+            # Add wallet addresses in the same order
+            for idx, submission in enumerate(submissions):
+                form_data.add_field(f'wallet_{idx + 1}',
+                                  submission['wallet_address'])
+
+            # Submit to evaluation API
             async with aiohttp.ClientSession() as session:
-                async with session.post('https://your-evaluation-api.com/submit', json=submission_data) as response:
+                async with session.post('https://music-evaluation.onrender.com/evaluate-tracks/',
+                                      data=form_data) as response:
+                    if response.status != 200:
+                        raise Exception(f"API returned status code {response.status}")
                     result = await response.json()
 
-            winner_wallet = result.get('winner_wallet')
-            participants = self.participants_db.get_participants(chat_id)
+            # Get winner details
+            winner_wallet = result['winner_wallet']
+            winning_track = result['winning_track']
+            winning_score = result['score']
 
-            winner = next(
-                (p for p in participants.values() if p['wallet_address'] == winner_wallet),
-                None
+            # Format rankings message
+            rankings_message = "🎵 Battle Results 🎵\n\n"
+
+            # Add timestamp
+            battle_time = datetime.fromisoformat(result['timestamp'])
+            rankings_message += f"🕒 Battle completed at: {battle_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+            # Add rankings
+            for idx, ranking in enumerate(result['all_rankings'], 1):
+                wallet = ranking['wallet_address']
+                score = ranking['quality_score']
+                track = ranking['file_name']
+                features = ranking['features']
+
+                participant = next(
+                    (p for p in participants.values() if p['wallet_address'] == wallet),
+                    None
+                )
+
+                username = participant['username'] if participant else "Unknown"
+
+                rankings_message += f"#{idx} @{username}\n"
+                rankings_message += f"🎵 Track: {track}\n"
+                rankings_message += f"💰 Wallet: {wallet[:6]}...{wallet[-4:]}\n"
+                rankings_message += f"📊 Score: {score:.2f}\n"
+                rankings_message += "🎼 Features:\n"
+                rankings_message += f"  • Energy: {features['energy']:.3f}\n"
+                rankings_message += f"  • Danceability: {features['danceability']:.3f}\n"
+                rankings_message += f"  • Instrumentalness: {features['instrumentalness']:.3f}\n"
+                rankings_message += f"  • Loudness: {features['loudness']:.2f} dB\n\n"
+
+            # Add transaction hash
+            rankings_message += f"🔗 Transaction Hash: {result['transaction_hash'][:6]}...{result['transaction_hash'][-4:]}\n\n"
+
+            # Add score differences if available
+            if result.get('score_differences'):
+                rankings_message += "📊 Score Differences:\n"
+                for idx, diff in enumerate(result['score_differences'], 1):
+                    rankings_message += f"#{idx+1} vs #{idx}: {diff:.3f} points\n"
+
+            # Send results
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=rankings_message,
+                parse_mode='HTML'
             )
-
-            message = (f"🏆 Battle Winner: @{winner['username']} (Wallet: {winner_wallet})"
-                      if winner else "No winner could be determined.")
-
-            self.bot.send_message(chat_id=chat_id, text=message)
 
             # Reset battle
             self.participants_db.reset_battle(chat_id)
@@ -335,19 +468,18 @@ class SongBattleBot:
 
         except Exception as e:
             logger.error(f"Evaluation error for group {chat_id}: {e}")
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ An error occurred during battle evaluation. Please try again later."
+            )
+
+    # [Rest of the code remains the same...]
 
     async def run(self):
         """Run the bot with battle checking"""
         logger.info("Starting bot...")
-        # Start the battle checker
-        asyncio.create_task(self.check_for_battles())
-        # Start the bot
-        await self.bot.polling(non_stop=True)
-
-if __name__ == "__main__":
-    # Initialize and run bot
-    BOT_TOKEN = "*************************************"
-    bot = SongBattleBot(BOT_TOKEN)
-
-    # Run the bot with asyncio
-    asyncio.run(bot.run())
+        # Start both the battle checker and polling in parallel
+        await asyncio.gather(
+            self.check_for_battles(),
+            self.bot.polling()
+        )
