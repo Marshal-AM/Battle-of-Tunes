@@ -30,93 +30,87 @@ class ParticipantsDatabase:
         cursor = conn.cursor()
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS participants (
-            user_id INTEGER,
+            user_id INTEGER PRIMARY KEY,
             username TEXT,
             wallet_address TEXT,
             audio_file TEXT,
-            chat_id INTEGER,
             verified BOOLEAN DEFAULT 1,
             battle_start_timestamp DATETIME,
-            battle_active BOOLEAN DEFAULT 0,
-            PRIMARY KEY (user_id, chat_id)
+            battle_active BOOLEAN DEFAULT 0
         )
         ''')
         conn.commit()
         conn.close()
 
-    def add_participant(self, user_id, username, wallet_address, chat_id):
+    def verify_participant(self, wallet_address, user_id):
+        """Verify if a participant exists with the given wallet address and matches the user"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             try:
                 cursor.execute('''
-                DELETE FROM participants
-                WHERE user_id = ? AND chat_id = ?
-                ''', (user_id, chat_id))
-
-                cursor.execute('''
-                INSERT INTO participants
-                (user_id, username, wallet_address, chat_id, verified)
-                VALUES (?, ?, ?, ?, 1)
-                ''', (user_id, username, wallet_address, chat_id))
-                conn.commit()
-                return True
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return False
-            finally:
-                conn.close()
-
-    def update_participant_audio(self, user_id, chat_id, audio_file):
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            try:
-                cursor.execute('''
-                UPDATE participants
-                SET audio_file = ?
-                WHERE user_id = ? AND chat_id = ?
-                ''', (audio_file, user_id, chat_id))
-                conn.commit()
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-            finally:
-                conn.close()
-
-    def check_wallet_address(self, wallet_address):
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            try:
-                cursor.execute('''
-                SELECT COUNT(*)
+                SELECT user_id
                 FROM participants
                 WHERE wallet_address = ?
                 ''', (wallet_address,))
                 result = cursor.fetchone()
-                return result[0] > 0
+
+                if result is None:
+                    return False, "No participant found with this wallet address"
+
+                db_user_id = result[0]
+                if db_user_id != user_id:
+                    return False, "Wallet address belongs to a different user"
+
+                return True, "Participant verified successfully"
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
-                return False
+                return False, f"Database error: {str(e)}"
             finally:
                 conn.close()
 
-# Replace with your actual configurations
-BOT_TOKEN = '*****************************'
-MUSIC_MODEL_API = '*************************************'
+    def update_participant_audio(self, user_id, audio_file):
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            try:
+                # First check if the participant exists
+                cursor.execute('''
+                SELECT COUNT(*)
+                FROM participants
+                WHERE user_id = ?
+                ''', (user_id,))
 
-# Initialize the Telegram Bot and Database
+                if cursor.fetchone()[0] == 0:
+                    conn.close()
+                    return False, "Participant not found"
+
+                cursor.execute('''
+                UPDATE participants
+                SET audio_file = ?
+                WHERE user_id = ?
+                ''', (audio_file, user_id))
+                conn.commit()
+                return True, "Audio file updated successfully"
+            except sqlite3.Error as e:
+                logger.error(f"Database error: {e}")
+                return False, f"Database error: {str(e)}"
+            finally:
+                conn.close()
+
+# Bot initialization and configuration
+BOT_TOKEN = '***********************************'
+MUSIC_MODEL_API = '*******************************'
+
 bot = AsyncTeleBot(BOT_TOKEN)
 db_manager = ParticipantsDatabase()
 
-# Store user states and last generated audio
 user_states = {}
 user_last_audio = {}
 
-def validate_wallet_address(wallet_address):
-    if not wallet_address.startswith('0x') or len(wallet_address) != 42:
-        return False
-    return db_manager.check_wallet_address(wallet_address)
+def validate_wallet_address(address):
+    """Basic wallet address format validation"""
+    return address.startswith('0x') and len(address) == 42
 
 @bot.message_handler(commands=['start'])
 async def send_welcome(message):
@@ -125,36 +119,38 @@ async def send_welcome(message):
         "Please provide your Ethereum wallet address to verify your participation."
     )
     await bot.reply_to(message, welcome_text)
-    user_states[message.chat.id] = 'awaiting_wallet_address'
+    user_states[message.from_user.id] = 'awaiting_wallet_address'
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'awaiting_wallet_address')
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == 'awaiting_wallet_address')
 async def verify_wallet(message):
     wallet_address = message.text.strip()
 
-    if validate_wallet_address(wallet_address):
-        db_manager.add_participant(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            wallet_address=wallet_address,
-            chat_id=message.chat.id
-        )
+    if not validate_wallet_address(wallet_address):
+        await bot.reply_to(message, "Invalid wallet address format. Please provide a valid Ethereum address.")
+        return
 
+    success, msg = db_manager.verify_participant(
+        wallet_address=wallet_address,
+        user_id=message.from_user.id
+    )
+
+    if success:
         welcome_text = (
-            "Welcome! Your wallet has been verified. 🎉\n\n"
+            "Welcome back! Your wallet has been verified. 🎉\n\n"
             "Use /generate to create music with a text prompt\n"
             "Use /about to learn more about the bot"
         )
         await bot.reply_to(message, welcome_text)
-        user_states[message.chat.id] = None
+        user_states[message.from_user.id] = None
     else:
-        await bot.reply_to(message, "Invalid wallet address or you are not a registered participant. Please try again.")
+        await bot.reply_to(message, f"Verification failed: {msg}")
 
 @bot.message_handler(commands=['generate'])
 async def initiate_generation(message):
     await bot.reply_to(message, "Please send me a text prompt describing the music you want to generate.")
-    user_states[message.chat.id] = 'awaiting_prompt'
+    user_states[message.from_user.id] = 'awaiting_prompt'
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'awaiting_prompt')
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == 'awaiting_prompt')
 async def generate_music(message):
     """Handle music generation requests with base64 audio response"""
     waiting_message = await bot.reply_to(message, "Please wait till we perform magic (create your music audio file)...")
@@ -174,14 +170,14 @@ async def generate_music(message):
 
                     if not base64_audio:
                         await bot.reply_to(message, "Error: No audio data received from the server.")
-                        user_states[message.chat.id] = None
+                        user_states[message.from_user.id] = None
                         return
 
                     # Decode base64 string to binary audio data
                     audio_binary = base64.b64decode(base64_audio)
 
                     # Save the decoded audio to an MP3 file
-                    audio_file_path = f'generated_music_{message.chat.id}.mp3'
+                    audio_file_path = f'generated_music_{message.from_user.id}.mp3'
                     with open(audio_file_path, 'wb') as f:
                         f.write(audio_binary)
 
@@ -193,7 +189,7 @@ async def generate_music(message):
                     await bot.delete_message(message.chat.id, waiting_message.message_id)
 
                     # Store the audio file path for potential submission
-                    user_last_audio[message.chat.id] = audio_file_path
+                    user_last_audio[message.from_user.id] = audio_file_path
 
                     # Ask for satisfaction with submit option
                     satisfaction_markup = ReplyKeyboardMarkup(row_width=2)
@@ -207,35 +203,41 @@ async def generate_music(message):
                         reply_markup=satisfaction_markup
                     )
 
-                    user_states[message.chat.id] = 'awaiting_satisfaction'
+                    user_states[message.from_user.id] = 'awaiting_satisfaction'
                 else:
                     error_message = f"Sorry, music generation failed. Status code: {response.status}"
                     await bot.reply_to(message, error_message)
-                    user_states[message.chat.id] = None
+                    user_states[message.from_user.id] = None
 
     except Exception as e:
         error_message = f"An error occurred: {str(e)}"
         await bot.reply_to(message, error_message)
-        user_states[message.chat.id] = None
+        user_states[message.from_user.id] = None
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'awaiting_satisfaction')
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == 'awaiting_satisfaction')
 async def handle_satisfaction(message):
     if message.text.lower() == 'submit':
-        if message.chat.id in user_last_audio:
+        if message.from_user.id in user_last_audio:
             try:
-                db_manager.update_participant_audio(
+                success, msg = db_manager.update_participant_audio(
                     user_id=message.from_user.id,
-                    chat_id=message.chat.id,
-                    audio_file=user_last_audio[message.chat.id]
+                    audio_file=user_last_audio[message.from_user.id]
                 )
 
-                await bot.send_message(
-                    message.chat.id,
-                    "Audio successfully submitted and recorded! 🎵",
-                    reply_markup=ReplyKeyboardRemove()
-                )
+                if success:
+                    await bot.send_message(
+                        message.chat.id,
+                        "Audio successfully submitted and recorded! 🎵",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                else:
+                    await bot.send_message(
+                        message.chat.id,
+                        f"Submission failed: {msg}",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
 
-                del user_last_audio[message.chat.id]
+                del user_last_audio[message.from_user.id]
             except Exception as e:
                 await bot.send_message(
                     message.chat.id,
@@ -243,7 +245,7 @@ async def handle_satisfaction(message):
                     reply_markup=ReplyKeyboardRemove()
                 )
 
-            user_states[message.chat.id] = None
+            user_states[message.from_user.id] = None
         else:
             await bot.send_message(
                 message.chat.id,
@@ -256,11 +258,11 @@ async def handle_satisfaction(message):
             "No problem! Use /generate command again to create another music file.",
             reply_markup=ReplyKeyboardRemove()
         )
-        if message.chat.id in user_last_audio:
-            os.remove(user_last_audio[message.chat.id])
-            del user_last_audio[message.chat.id]
+        if message.from_user.id in user_last_audio:
+            os.remove(user_last_audio[message.from_user.id])
+            del user_last_audio[message.from_user.id]
 
-        user_states[message.chat.id] = None
+        user_states[message.from_user.id] = None
     else:
         await bot.send_message(
             message.chat.id,
