@@ -1,8 +1,7 @@
 import os
 import asyncio
 import logging
-import sqlite3
-import threading
+import mysql.connector
 from datetime import datetime, timedelta
 import telebot
 from telebot.async_telebot import AsyncTeleBot
@@ -17,36 +16,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-AUDIO_GEN_BOT_USERNAME = "@musicgen_051203_bot"  # Replace with actual audio generation bot username
+AUDIO_GEN_BOT_USERNAME = "@musicgen_051203_bot"
+
+# MySQL Configuration
+MYSQL_CONFIG = {
+    'host': '**********',
+    'user': '**********',
+    'password': '**********',
+    'database': '***********',
+}
 
 class ParticipantsDatabase:
-    def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
-        self.db_path = db_path
-        self._lock = threading.Lock()
-
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-
-        # Initialize database with lock to prevent race conditions
-        with self._lock:
-            self._init_database()
+    def __init__(self):
+        self._init_database()
 
     def _init_database(self):
         """Create the database tables if they don't exist."""
-        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            # Create initial connection to create database
+            conn = mysql.connector.connect(
+                host=MYSQL_CONFIG['host'],
+                user=MYSQL_CONFIG['user'],
+                password=MYSQL_CONFIG['password']
+            )
             cursor = conn.cursor()
 
+            # Create database if it doesn't exist
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_CONFIG['database']}")
+            cursor.execute(f"USE {MYSQL_CONFIG['database']}")
+
+            # Create participants table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS participants (
-                    user_id INTEGER,
-                    username TEXT,
-                    wallet_address TEXT,
-                    audio_file TEXT,
-                    chat_id INTEGER,
+                    user_id BIGINT,
+                    username VARCHAR(255),
+                    wallet_address VARCHAR(255),
+                    audio_filename VARCHAR(255),
+                    audio_data LONGBLOB,
+                    chat_id BIGINT,
                     verified BOOLEAN DEFAULT 1,
-                    battle_start_timestamp DATETIME,
+                    battle_start_timestamp TIMESTAMP,
                     battle_active BOOLEAN DEFAULT 0,
                     PRIMARY KEY (user_id, chat_id)
                 )
@@ -54,185 +63,200 @@ class ParticipantsDatabase:
 
             conn.commit()
 
-        except sqlite3.Error as e:
+        except mysql.connector.Error as e:
             logger.error(f"Failed to initialize database: {e}")
             raise
         finally:
-            if conn:
-                conn.close()
+            cursor.close()
+            conn.close()
+
+    def _get_connection(self):
+        """Create a new MySQL connection."""
+        return mysql.connector.connect(**MYSQL_CONFIG)
 
     def get_all_inactive_participants(self):
         """Get all participants who aren't in an active battle"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT user_id, username, wallet_address, chat_id
+                FROM participants
+                WHERE battle_active = 0
+                ORDER BY COALESCE(battle_start_timestamp, NOW()) DESC
+            ''')
+            return cursor.fetchall()
 
-            try:
-                cursor.execute('''
-                    SELECT user_id, username, wallet_address, chat_id
-                    FROM participants
-                    WHERE battle_active = 0
-                    ORDER BY battle_start_timestamp DESC NULLS LAST
-                ''')
-                return cursor.fetchall()
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return []
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
 
     def get_participants(self, chat_id):
         """Get active participants for a specific group"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT user_id, username, wallet_address, audio_filename, audio_data
+                FROM participants
+                WHERE chat_id = %s AND battle_active = 1
+            ''', (chat_id,))
+            results = cursor.fetchall()
 
-            try:
-                cursor.execute('''
-                    SELECT user_id, username, wallet_address, audio_file
-                    FROM participants
-                    WHERE chat_id = ? AND battle_active = 1
-                ''', (chat_id,))
-                results = cursor.fetchall()
+            participants = {}
+            for result in results:
+                participants[result[0]] = {
+                    'username': result[1],
+                    'wallet_address': result[2],
+                    'audio_filename': result[3],
+                    'audio_data': result[4]
+                }
 
-                participants = {}
-                for result in results:
-                    participants[result[0]] = {
-                        'username': result[1],
-                        'wallet_address': result[2],
-                        'audio_file': result[3]
-                    }
+            return participants
 
-                return participants
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return {}
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return {}
+        finally:
+            cursor.close()
+            conn.close()
 
     def get_all_participants_for_chat(self, chat_id):
-        """Get all participants (both active and inactive) for a specific group"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        """Get all participants for a specific group"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT username, wallet_address, battle_active
+                FROM participants
+                WHERE chat_id = %s
+                ORDER BY battle_active DESC, username
+            ''', (chat_id,))
+            return cursor.fetchall()
 
-            try:
-                cursor.execute('''
-                    SELECT username, wallet_address, battle_active
-                    FROM participants
-                    WHERE chat_id = ?
-                    ORDER BY battle_active DESC, username
-                ''', (chat_id,))
-                return cursor.fetchall()
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return []
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
 
     def activate_battle_for_users(self, user_ids, chat_id):
         """Activate battle for specified users in a chat"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            placeholders = ', '.join(['%s'] * len(user_ids))
+            cursor.execute(f'''
+                UPDATE participants
+                SET battle_active = 1,
+                    battle_start_timestamp = NOW()
+                WHERE user_id IN ({placeholders}) AND chat_id = %s
+            ''', (*user_ids, chat_id))
 
-            try:
-                cursor.execute('''
-                    UPDATE participants
-                    SET battle_active = 1,
-                        battle_start_timestamp = datetime('now')
-                    WHERE user_id IN ({}) AND chat_id = ?
-                '''.format(','.join('?' * len(user_ids))), (*user_ids, chat_id))
+            conn.commit()
+            return True
 
-                conn.commit()
-                return True
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return False
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
 
     def check_user_in_battle(self, user_id, chat_id):
         """Check if user is in active battle"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM participants
+                WHERE user_id = %s AND chat_id = %s AND battle_active = 1
+            ''', (user_id, chat_id))
+            result = cursor.fetchone()
+            return result[0] > 0
 
-            try:
-                cursor.execute('''
-                    SELECT COUNT(*)
-                    FROM participants
-                    WHERE user_id = ? AND chat_id = ? AND battle_active = 1
-                ''', (user_id, chat_id))
-                result = cursor.fetchone()
-                return result[0] > 0
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return False
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
 
     def check_all_participants_submitted(self, chat_id):
         """Check if all participants have submitted audio"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM participants
+                WHERE chat_id = %s AND battle_active = 1 AND audio_data IS NULL
+            ''', (chat_id,))
+            result = cursor.fetchone()
+            return result[0] == 0
 
-            try:
-                cursor.execute('''
-                    SELECT COUNT(*)
-                    FROM participants
-                    WHERE chat_id = ? AND battle_active = 1 AND audio_file IS NULL
-                ''', (chat_id,))
-                result = cursor.fetchone()
-                return result[0] == 0
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return False
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
 
     def get_participants_for_submission(self, chat_id):
         """Get participants with their audio files"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT wallet_address, audio_data
+                FROM participants
+                WHERE chat_id = %s AND battle_active = 1 AND audio_data IS NOT NULL
+            ''', (chat_id,))
+            return [
+                {
+                    'wallet_address': result[0],
+                    'audio_file': result[1]
+                }
+                for result in cursor.fetchall()
+            ]
 
-            try:
-                cursor.execute('''
-                    SELECT wallet_address, audio_file
-                    FROM participants
-                    WHERE chat_id = ? AND battle_active = 1 AND audio_file IS NOT NULL
-                ''', (chat_id,))
-                return [
-                    {
-                        'wallet_address': result[0],
-                        'audio_file': result[1]
-                    }
-                    for result in cursor.fetchall()
-                ]
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-                return []
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
 
     def reset_battle(self, chat_id):
         """Delete participants who were in the battle for a specific group"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                DELETE FROM participants
+                WHERE chat_id = %s AND battle_active = 1
+            ''', (chat_id,))
+            conn.commit()
 
-            try:
-                cursor.execute('''
-                    DELETE FROM participants
-                    WHERE chat_id = ? AND battle_active = 1
-                ''', (chat_id,))
-                conn.commit()
-            except sqlite3.Error as e:
-                logger.error(f"Database error: {e}")
-            finally:
-                conn.close()
+        except mysql.connector.Error as e:
+            logger.error(f"Database error: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+
 
 class SongBattleBot:
     def __init__(self, token):
@@ -319,7 +343,7 @@ class SongBattleBot:
                     if chat_id in self.active_battles:
                         continue
 
-                    if len(participants) >= 2:
+                    if len(participants) >= 3:
                         valid_participants = []
                         for user_id, username, wallet in participants:
                             try:
@@ -329,7 +353,7 @@ class SongBattleBot:
                             except telebot.apihelper.ApiTelegramException:
                                 continue
 
-                        if len(valid_participants) == 2:
+                        if len(valid_participants) == 3:
                             user_ids = [p[0] for p in valid_participants]
                             if self.participants_db.activate_battle_for_users(user_ids, chat_id):
                                 self.active_battles.add(chat_id)
@@ -338,7 +362,7 @@ class SongBattleBot:
             except Exception as e:
                 logger.error(f"Error in battle checking: {e}")
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
     async def start_battle(self, chat_id, participants):
         """Start a battle with the given participants"""
@@ -390,8 +414,9 @@ class SongBattleBot:
             if chat_id in self.active_battles:
                 self.active_battles.remove(chat_id)
 
+
     async def submit_to_evaluation(self, chat_id):
-        """Submit to evaluation API using form-data format with MP3 files"""
+        """Submit to evaluation API using form-data format with MP3 files."""
         submissions = self.participants_db.get_participants_for_submission(chat_id)
 
         logger.info(f"Starting evaluation submission for chat {chat_id}")
@@ -401,25 +426,17 @@ class SongBattleBot:
             # Prepare form data
             form_data = aiohttp.FormData()
 
-            # Log submission details
             logger.info("Preparing form data with the following submissions:")
+            files = []
+            wallet_addresses = []
+
             for idx, submission in enumerate(submissions, 1):
                 logger.info(f"Submission {idx}:")
                 logger.info(f"  Wallet: {submission['wallet_address']}")
                 logger.info(f"  Audio data size: {len(submission['audio_file'])} bytes")
 
-            # Add audio files first (in order)
-            for idx, submission in enumerate(submissions):
-                # Get binary audio data from the submission
-                audio_data = submission['audio_file']  # This is the blob data from DB
-                field_name = f'audio_{idx + 1}'
-                filename = f'track{idx + 1}.mp3'
-
-                logger.info(f"Adding audio field: {field_name}")
-                logger.info(f"  Filename: {filename}")
-                logger.info(f"  Content type: audio/mpeg")
-
-                # Create a bytes object from the binary blob data
+                # Convert blob to MP3
+                audio_data = submission['audio_file']
                 if isinstance(audio_data, memoryview):
                     audio_bytes = audio_data.tobytes()
                 elif isinstance(audio_data, bytes):
@@ -427,42 +444,43 @@ class SongBattleBot:
                 else:
                     audio_bytes = bytes(audio_data)
 
-                # Add the audio data to the form
+                # Append to files list
+                files.append((f"track{idx}.mp3", audio_bytes))
+
+                # Append wallet addresses in order
+                wallet_addresses.append(submission['wallet_address'])
+
+            # Add all files to the form data first
+            for file_name, file_content in files:
                 form_data.add_field(
-                    name=field_name,
-                    value=audio_bytes,
-                    filename=filename,
-                    content_type='audio/mpeg'
+                    name="files",
+                    value=file_content,
+                    filename=file_name,
+                    content_type="audio/mpeg"
                 )
+                logger.info(f"Added file: {file_name} (size: {len(file_content)} bytes)")
 
-            # Add wallet addresses in the same order
-            for idx, submission in enumerate(submissions):
-                field_name = f'wallet_{idx + 1}'
-                wallet = submission['wallet_address']
+            # Add all wallet addresses to the form data
+            for wallet in wallet_addresses:
+                form_data.add_field(name="wallet_addresses", value=wallet)
+                logger.info(f"Added wallet address: {wallet}")
 
-                logger.info(f"Adding wallet field: {field_name}")
-                logger.info(f"  Wallet address: {wallet}")
-
-                form_data.add_field(field_name, wallet)
-
-            # Print form data contents for debugging
             logger.info("\nFinal form data fields:")
             for field in form_data._fields:
                 logger.info(f"Field name: {field[0]}")
-                logger.info(f"Content type: {field[2].get('content_type', 'text/plain')}")
-                if field[2].get('filename'):
-                    logger.info(f"Filename: {field[2]['filename']}")
+                if isinstance(field[2], dict):
+                    logger.info(f"Content type: {field[2].get('content_type', 'text/plain')}")
+                    if field[2].get('filename'):
+                        logger.info(f"Filename: {field[2]['filename']}")
+                else:
+                    logger.info("Content type: Unknown (raw bytes)")
                 logger.info("---")
 
             logger.info("Making API call to evaluation endpoint...")
 
             # Submit to evaluation API
             async with aiohttp.ClientSession() as session:
-                logger.info("Starting API request to https://music-evaluation.onrender.com/evaluate-tracks/")
-
-                # Set a longer timeout for the API call since we're sending audio files
-                timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
-
+                timeout = aiohttp.ClientTimeout(total=300)  # Set a longer timeout (5 minutes)
                 async with session.post(
                     'https://music-evaluation.onrender.com/evaluate-tracks/',
                     data=form_data,
@@ -479,7 +497,7 @@ class SongBattleBot:
                     result = await response.json()
                     logger.info("Successfully parsed JSON response")
 
-            # Get winner details
+            # Process response and prepare rankings
             winner_wallet = result['winner_wallet']
             winning_track = result['winning_track']
             winning_score = result['score']
@@ -488,14 +506,10 @@ class SongBattleBot:
             logger.info(f"Winning track: {winning_track}")
             logger.info(f"Winning score: {winning_score}")
 
-            # Format rankings message
             rankings_message = "🎵 Battle Results 🎵\n\n"
-
-            # Add timestamp
             battle_time = datetime.fromisoformat(result['timestamp'])
             rankings_message += f"🕒 Battle completed at: {battle_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
-            # Add rankings
             participants = self.participants_db.get_participants(chat_id)
             for idx, ranking in enumerate(result['all_rankings'], 1):
                 wallet = ranking['wallet_address']
@@ -507,7 +521,6 @@ class SongBattleBot:
                     (p for p in participants.values() if p['wallet_address'] == wallet),
                     None
                 )
-
                 username = participant['username'] if participant else "Unknown"
 
                 rankings_message += f"#{idx} @{username}\n"
@@ -520,28 +533,17 @@ class SongBattleBot:
                 rankings_message += f"  • Instrumentalness: {features['instrumentalness']:.3f}\n"
                 rankings_message += f"  • Loudness: {features['loudness']:.2f} dB\n\n"
 
-            # Add transaction hash
             rankings_message += f"🔗 Transaction Hash: {result['transaction_hash'][:6]}...{result['transaction_hash'][-4:]}\n\n"
 
-            # Add score differences if available
             if result.get('score_differences'):
                 rankings_message += "📊 Score Differences:\n"
                 for idx, diff in enumerate(result['score_differences'], 1):
                     rankings_message += f"#{idx+1} vs #{idx}: {diff:.3f} points\n"
 
             logger.info("Sending results message to chat")
-
-            # Send results
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=rankings_message,
-                parse_mode='HTML'
-            )
-
+            await self.bot.send_message(chat_id=chat_id, text=rankings_message, parse_mode='HTML')
             logger.info("Results message sent successfully")
 
-            # Delete the participants who were in this battle
-            logger.info("Resetting battle state")
             self.participants_db.reset_battle(chat_id)
             del self.evaluation_tasks[chat_id]
             logger.info("Battle reset completed")
@@ -553,6 +555,7 @@ class SongBattleBot:
                 chat_id=chat_id,
                 text="⚠️ An error occurred during battle evaluation. Please try again later."
             )
+
 
 
     async def run(self):
