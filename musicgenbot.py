@@ -3,9 +3,9 @@ import asyncio
 import logging
 import sqlite3
 import threading
-import requests
-import telebot
-import base64  # Added for base64 decoding
+import aiohttp
+import nest_asyncio
+import base64
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import ReplyKeyboardMarkup, ReplyKeyboardRemove
 
@@ -15,6 +15,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+nest_asyncio.apply()
 
 class ParticipantsDatabase:
     def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
@@ -27,15 +29,15 @@ class ParticipantsDatabase:
         cursor = conn.cursor()
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS participants (
-        user_id INTEGER,
-        username TEXT,
-        wallet_address TEXT,
-        audio_file TEXT,
-        chat_id INTEGER,
-        verified BOOLEAN DEFAULT 1,
-        battle_start_timestamp DATETIME,
-        battle_active BOOLEAN DEFAULT 0,
-        PRIMARY KEY (user_id, chat_id)
+            user_id INTEGER,
+            username TEXT,
+            wallet_address TEXT,
+            audio_file TEXT,
+            chat_id INTEGER,
+            verified BOOLEAN DEFAULT 1,
+            battle_start_timestamp DATETIME,
+            battle_active BOOLEAN DEFAULT 0,
+            PRIMARY KEY (user_id, chat_id)
         )
         ''')
         conn.commit()
@@ -99,11 +101,11 @@ class ParticipantsDatabase:
                 conn.close()
 
 # Replace with your actual configurations
-BOT_TOKEN = '***************************'
-MUSIC_MODEL_API = '*********************************'
+BOT_TOKEN = '******************************'
+MUSIC_MODEL_API = '*****************************'
 
 # Initialize the Telegram Bot and Database
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = AsyncTeleBot(BOT_TOKEN)
 db_manager = ParticipantsDatabase()
 
 # Store user states and last generated audio
@@ -151,7 +153,6 @@ async def initiate_generation(message):
     await bot.reply_to(message, "Please send me a text prompt describing the music you want to generate.")
     user_states[message.chat.id] = 'awaiting_prompt'
 
-# Updated generate_music function to handle base64 response
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'awaiting_prompt')
 async def generate_music(message):
     """Handle music generation requests with base64 audio response"""
@@ -163,55 +164,53 @@ async def generate_music(message):
             'data': [message.text]
         }
 
-        # Make POST request to the music generation API
-        response = requests.post(MUSIC_MODEL_API, json=payload)
+        # Make POST request to the music generation API using aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(MUSIC_MODEL_API, json=payload) as response:
+                if response.status == 200:
+                    response_data = await response.json()
+                    base64_audio = response_data.get('data', {}).get('audio')
 
-        # Check if the request was successful
-        if response.status_code == 200:
-            # Parse JSON response and extract base64 audio
-            response_data = response.json()
-            base64_audio = response_data.get('data', {}).get('audio')
+                    if not base64_audio:
+                        await bot.reply_to(message, "Error: No audio data received from the server.")
+                        user_states[message.chat.id] = None
+                        return
 
-            if not base64_audio:
-                await bot.reply_to(message, "Error: No audio data received from the server.")
-                user_states[message.chat.id] = None
-                return
+                    # Decode base64 string to binary audio data
+                    audio_binary = base64.b64decode(base64_audio)
 
-            # Decode base64 string to binary audio data
-            audio_binary = base64.b64decode(base64_audio)
+                    # Save the decoded audio to an MP3 file
+                    audio_file_path = f'generated_music_{message.chat.id}.mp3'
+                    with open(audio_file_path, 'wb') as f:
+                        f.write(audio_binary)
 
-            # Save the decoded audio to an MP3 file
-            audio_file_path = f'generated_music_{message.chat.id}.mp3'
-            with open(audio_file_path, 'wb') as f:
-                f.write(audio_binary)
+                    # Send the audio file
+                    with open(audio_file_path, 'rb') as audio:
+                        await bot.send_audio(message.chat.id, audio)
 
-            # Send the audio file
-            with open(audio_file_path, 'rb') as audio:
-                await bot.send_audio(message.chat.id, audio)
+                    # Delete the waiting message
+                    await bot.delete_message(message.chat.id, waiting_message.message_id)
 
-            # Delete the waiting message
-            await bot.delete_message(message.chat.id, waiting_message.message_id)
+                    # Store the audio file path for potential submission
+                    user_last_audio[message.chat.id] = audio_file_path
 
-            # Store the audio file path for potential submission
-            user_last_audio[message.chat.id] = audio_file_path
+                    # Ask for satisfaction with submit option
+                    satisfaction_markup = ReplyKeyboardMarkup(row_width=2)
+                    submit_button = telebot.types.KeyboardButton('Submit')
+                    no_button = telebot.types.KeyboardButton('No')
+                    satisfaction_markup.add(submit_button, no_button)
 
-            # Ask for satisfaction with submit option
-            satisfaction_markup = ReplyKeyboardMarkup(row_width=2)
-            submit_button = telebot.types.KeyboardButton('Submit')
-            no_button = telebot.types.KeyboardButton('No')
-            satisfaction_markup.add(submit_button, no_button)
+                    await bot.send_message(
+                        message.chat.id,
+                        "Do you want to submit this audio or generate a new one?",
+                        reply_markup=satisfaction_markup
+                    )
 
-            await bot.send_message(
-                message.chat.id,
-                "Do you want to submit this audio or generate a new one?",
-                reply_markup=satisfaction_markup
-            )
-
-            user_states[message.chat.id] = 'awaiting_satisfaction'
-        else:
-            error_message = f"Sorry, music generation failed. Status code: {response.status_code}"
-            await bot.reply_to(message, error_message)
-            user_states[message.chat.id] = None
+                    user_states[message.chat.id] = 'awaiting_satisfaction'
+                else:
+                    error_message = f"Sorry, music generation failed. Status code: {response.status}"
+                    await bot.reply_to(message, error_message)
+                    user_states[message.chat.id] = None
 
     except Exception as e:
         error_message = f"An error occurred: {str(e)}"
@@ -268,13 +267,34 @@ async def handle_satisfaction(message):
             reply_markup=ReplyKeyboardRemove()
         )
 
+@bot.message_handler(commands=['about'])
+async def about_bot(message):
+    about_text = (
+        "🎵 *Music Generation Bot* 🎵\n\n"
+        "This bot uses AI to generate music based on your text descriptions.\n\n"
+        "Available commands:\n"
+        "/start - Start the bot and verify your wallet\n"
+        "/generate - Create new music with a text prompt\n"
+        "/about - Show this information\n\n"
+        "Created for the Battle of Tunes competition 🏆"
+    )
+    await bot.send_message(message.chat.id, about_text, parse_mode="Markdown")
+
 @bot.message_handler(func=lambda message: True)
 async def handle_other_messages(message):
     await bot.reply_to(message, "Please use /generate to create music or /about to learn more about the bot.")
 
-def main():
+# Replace the last part of your code (the main execution part) with this:
+
+async def main():
     print("Bot is running...")
-    bot.polling(none_stop=True)
+    try:
+        await bot.polling(non_stop=True, timeout=60)
+    except Exception as e:
+        logger.error(f"Bot polling error: {e}")
+        await asyncio.sleep(5)
+        await main()
 
 if __name__ == '__main__':
-    main()
+    # Simple execution that works in both Jupyter and regular Python
+    asyncio.run(main())
