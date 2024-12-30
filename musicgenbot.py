@@ -23,12 +23,24 @@ class ParticipantsDatabase:
     def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
         self.db_path = db_path
         self._lock = threading.Lock()
-        self._init_database()
 
-    def _init_database(self):
+        # Check if database file exists before initialization
+        db_exists = os.path.exists(self.db_path)
+
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        # Only create tables if database is new
+        if not db_exists:
+            self._create_tables()
+
+        # Verify database schema regardless
+        self._verify_schema()
+
+    def _create_tables(self):
+        """Create database tables for a new database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # Modified table schema to handle binary audio data
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS participants (
@@ -47,6 +59,47 @@ class ParticipantsDatabase:
 
         conn.commit()
         conn.close()
+
+    def _verify_schema(self):
+        """Verify that existing database has the correct schema"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            # Get table info
+            cursor.execute("PRAGMA table_info(participants)")
+            columns = {row[1]: row for row in cursor.fetchall()}
+
+            # Define expected columns and their types
+            expected_columns = {
+                'user_id': 'INTEGER',
+                'username': 'TEXT',
+                'wallet_address': 'TEXT',
+                'audio_filename': 'TEXT',
+                'audio_data': 'BLOB',
+                'chat_id': 'INTEGER',
+                'verified': 'BOOLEAN',
+                'battle_start_timestamp': 'DATETIME',
+                'battle_active': 'BOOLEAN'
+            }
+
+            # Check for missing columns
+            missing_columns = set(expected_columns.keys()) - set(columns.keys())
+            if missing_columns:
+                logging.warning(f"Missing columns in database: {missing_columns}")
+
+                # Add missing columns
+                for column in missing_columns:
+                    cursor.execute(f"ALTER TABLE participants ADD COLUMN {column} {expected_columns[column]}")
+
+                conn.commit()
+                logging.info("Database schema updated successfully")
+
+        except sqlite3.Error as e:
+            logging.error(f"Database schema verification failed: {e}")
+            raise
+        finally:
+            conn.close()
 
     def verify_participant(self, wallet_address, user_id):
         """Verify if a participant exists with the given wallet address and matches the user"""
@@ -135,8 +188,8 @@ class ParticipantsDatabase:
                 conn.close()
 
 # Bot initialization and configuration
-BOT_TOKEN = '****************************'
-MUSIC_MODEL_API = '*******************************'
+BOT_TOKEN = '*****************************'
+MUSIC_MODEL_API = '********************************'
 TEMP_DIR = 'temp_audio'  # Directory for temporary audio files
 
 # Create temporary directory if it doesn't exist
