@@ -1,7 +1,8 @@
 import os
 import asyncio
 import logging
-import sqlite3
+import mysql.connector
+from mysql.connector import Error
 import threading
 import aiohttp
 import nest_asyncio
@@ -20,97 +21,63 @@ logger = logging.getLogger(__name__)
 nest_asyncio.apply()
 
 class ParticipantsDatabase:
-    def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
-        self.db_path = db_path
+    def __init__(self):
+        self.db_config = {
+            'host': 'sql12.freesqldatabase.com',
+            'database': 'sql12754910',
+            'user': 'sql12754910',
+            'password': 'nDWLkDNtTI'
+        }
         self._lock = threading.Lock()
+        self._create_tables()
 
-        # Check if database file exists before initialization
-        db_exists = os.path.exists(self.db_path)
-
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-
-        # Only create tables if database is new
-        if not db_exists:
-            self._create_tables()
-
-        # Verify database schema regardless
-        self._verify_schema()
+    def _get_connection(self):
+        """Create and return a new database connection"""
+        try:
+            connection = mysql.connector.connect(**self.db_config)
+            return connection
+        except Error as e:
+            logger.error(f"Error connecting to MySQL Database: {e}")
+            raise
 
     def _create_tables(self):
-        """Create database tables for a new database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS participants (
-                user_id INTEGER,
-                username TEXT,
-                wallet_address TEXT,
-                audio_filename TEXT,
-                audio_data BLOB,
-                chat_id INTEGER,
-                verified BOOLEAN DEFAULT 1,
-                battle_start_timestamp DATETIME,
-                battle_active BOOLEAN DEFAULT 0,
-                PRIMARY KEY (user_id, chat_id)
-            )
-        ''')
-
-        conn.commit()
-        conn.close()
-
-    def _verify_schema(self):
-        """Verify that existing database has the correct schema"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        """Create database tables if they don't exist"""
+        connection = self._get_connection()
+        cursor = connection.cursor()
 
         try:
-            # Get table info
-            cursor.execute("PRAGMA table_info(participants)")
-            columns = {row[1]: row for row in cursor.fetchall()}
-
-            # Define expected columns and their types
-            expected_columns = {
-                'user_id': 'INTEGER',
-                'username': 'TEXT',
-                'wallet_address': 'TEXT',
-                'audio_filename': 'TEXT',
-                'audio_data': 'BLOB',
-                'chat_id': 'INTEGER',
-                'verified': 'BOOLEAN',
-                'battle_start_timestamp': 'DATETIME',
-                'battle_active': 'BOOLEAN'
-            }
-
-            # Check for missing columns
-            missing_columns = set(expected_columns.keys()) - set(columns.keys())
-            if missing_columns:
-                logging.warning(f"Missing columns in database: {missing_columns}")
-
-                # Add missing columns
-                for column in missing_columns:
-                    cursor.execute(f"ALTER TABLE participants ADD COLUMN {column} {expected_columns[column]}")
-
-                conn.commit()
-                logging.info("Database schema updated successfully")
-
-        except sqlite3.Error as e:
-            logging.error(f"Database schema verification failed: {e}")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS participants (
+                    user_id BIGINT,
+                    username VARCHAR(255),
+                    wallet_address VARCHAR(42),
+                    audio_filename VARCHAR(255),
+                    audio_data LONGBLOB,
+                    chat_id BIGINT,
+                    verified BOOLEAN DEFAULT TRUE,
+                    battle_start_timestamp DATETIME,
+                    battle_active BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
+            connection.commit()
+        except Error as e:
+            logger.error(f"Error creating tables: {e}")
             raise
         finally:
-            conn.close()
+            cursor.close()
+            connection.close()
 
     def verify_participant(self, wallet_address, user_id):
         """Verify if a participant exists with the given wallet address and matches the user"""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            connection = self._get_connection()
+            cursor = connection.cursor()
             try:
                 cursor.execute('''
                 SELECT user_id
                 FROM participants
-                WHERE wallet_address = ?
+                WHERE wallet_address = %s
                 ''', (wallet_address,))
                 result = cursor.fetchone()
 
@@ -122,23 +89,24 @@ class ParticipantsDatabase:
                     return False, "Wallet address belongs to a different user"
 
                 return True, "Participant verified successfully"
-            except sqlite3.Error as e:
+            except Error as e:
                 logger.error(f"Database error: {e}")
                 return False, f"Database error: {str(e)}"
             finally:
-                conn.close()
+                cursor.close()
+                connection.close()
 
     def update_participant_audio(self, user_id, audio_file_path):
         """Update participant's audio with binary data from the file"""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            connection = self._get_connection()
+            cursor = connection.cursor()
             try:
                 # Check if participant exists
                 cursor.execute('''
                 SELECT COUNT(*)
                 FROM participants
-                WHERE user_id = ?
+                WHERE user_id = %s
                 ''', (user_id,))
 
                 if cursor.fetchone()[0] == 0:
@@ -151,45 +119,47 @@ class ParticipantsDatabase:
                 # Update both audio data and filename
                 cursor.execute('''
                 UPDATE participants
-                SET audio_data = ?, audio_filename = ?
-                WHERE user_id = ?
+                SET audio_data = %s, audio_filename = %s
+                WHERE user_id = %s
                 ''', (audio_data, os.path.basename(audio_file_path), user_id))
 
-                conn.commit()
+                connection.commit()
                 return True, "Audio file updated successfully"
-            except sqlite3.Error as e:
+            except Error as e:
                 logger.error(f"Database error: {e}")
                 return False, f"Database error: {str(e)}"
             except IOError as e:
                 logger.error(f"File error: {e}")
                 return False, f"File error: {str(e)}"
             finally:
-                conn.close()
+                cursor.close()
+                connection.close()
 
     def get_participant_audio(self, user_id):
         """Retrieve audio data and filename for a participant"""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            connection = self._get_connection()
+            cursor = connection.cursor()
             try:
                 cursor.execute('''
                 SELECT audio_data, audio_filename
                 FROM participants
-                WHERE user_id = ?
+                WHERE user_id = %s
                 ''', (user_id,))
                 result = cursor.fetchone()
                 if result:
                     return result[0], result[1]  # Returns (audio_data, filename)
                 return None, None
-            except sqlite3.Error as e:
+            except Error as e:
                 logger.error(f"Database error: {e}")
                 return None, None
             finally:
-                conn.close()
+                cursor.close()
+                connection.close()
 
 # Bot initialization and configuration
-BOT_TOKEN = '*****************************'
-MUSIC_MODEL_API = '********************************'
+BOT_TOKEN = '****************************'
+MUSIC_MODEL_API = '**********************************'
 TEMP_DIR = 'temp_audio'  # Directory for temporary audio files
 
 # Create temporary directory if it doesn't exist
@@ -198,6 +168,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 bot = AsyncTeleBot(BOT_TOKEN)
 db_manager = ParticipantsDatabase()
 
+# Rest of the code remains the same from here...
 user_states = {}
 user_last_audio = {}
 
