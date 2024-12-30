@@ -7,16 +7,16 @@ import os
 from datetime import datetime
 
 class Config:
-    BOT_TOKEN = "************************"  
+    BOT_TOKEN = "******************************"
     WEB3_PROVIDER = "https://data-seed-prebsc-1-s1.binance.org:8545"
     CONTRACT_ADDRESS = "0xA546819d48330FB2E02D3424676d13D7B8af3bB2"
     CONTRACT_ABI = [{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":"false","inputs":[{"indexed":"true","internalType":"address","name":"recipient","type":"address"},{"indexed":"false","internalType":"uint256","name":"amount","type":"uint256"}],"name":"FundsSent","type":"event"},{"anonymous":"false","inputs":[{"indexed":"true","internalType":"address","name":"user","type":"address"},{"indexed":"false","internalType":"uint256","name":"amount","type":"uint256"}],"name":"Staked","type":"event"},{"inputs":[],"name":"STAKE_AMOUNT","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"hasStaked","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address payable","name":"recipient","type":"address"}],"name":"sendFundsTo","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"stake","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"}],"name":"verifyStake","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]
     DB_FOLDER = '/content/drive/MyDrive/BattleOfTunes/'
     DB_NAME = 'song_battle_participants.db'
-    STAKE_PAGE_URL = "*********************"
+    STAKE_PAGE_URL = "*************************"
     STAKE_AMOUNT = "0.0002"
     BASE_GROUP_INVITE_LINK = "https://t.me/+NxOSoOVa-BUwYWVl"
-    FIXED_CHAT_ID = -4701503942  
+    FIXED_CHAT_ID = -4701503942
 
 class DatabaseManager:
     def __init__(self):
@@ -37,7 +37,8 @@ class DatabaseManager:
                 user_id INTEGER,
                 username TEXT,
                 wallet_address TEXT,
-                audio_file TEXT,
+                audio_data BLOB,
+                audio_filename TEXT,
                 chat_id INTEGER,
                 verified BOOLEAN DEFAULT 1,
                 battle_start_timestamp DATETIME,
@@ -54,7 +55,7 @@ class DatabaseManager:
 
     def update_participant_info(self, user_id, username, wallet_address, chat_id=None):
         """Update or insert participant information"""
-        chat_id = Config.FIXED_CHAT_ID  # Always use the fixed chat ID
+        chat_id = Config.FIXED_CHAT_ID
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -63,8 +64,8 @@ class DatabaseManager:
                 cursor.execute('''
                 INSERT INTO participants
                 (user_id, username, wallet_address, chat_id, verified,
-                 battle_start_timestamp, battle_active, audio_file)
-                VALUES (?, ?, ?, ?, 1, ?, 0, NULL)
+                 battle_start_timestamp, battle_active, audio_data, audio_filename)
+                VALUES (?, ?, ?, ?, 1, ?, 0, NULL, NULL)
                 ON CONFLICT(user_id, chat_id) DO UPDATE SET
                 username = COALESCE(excluded.username, username),
                 wallet_address = COALESCE(excluded.wallet_address, wallet_address),
@@ -125,7 +126,12 @@ class BattleOfTunesBot:
                 for _ in range(18):  # 3 minute timeout
                     if self._verify_stake(user_wallet):
                         if self._handle_successful_stake(message, user_wallet):
-                            self.bot.reply_to(message, "Staking verified! You are now registered for Battle of Tunes.")
+                            success_message = (
+                                "🎉 Staking verified! You are now registered for Battle of Tunes.\n\n"
+                                "👥 Join the lobby by clicking here:\n"
+                                f"{Config.BASE_GROUP_INVITE_LINK}"
+                            )
+                            self.bot.reply_to(message, success_message)
                             return
                         break
                     time.sleep(10)
@@ -151,7 +157,12 @@ class BattleOfTunesBot:
 
                 if self._verify_stake(user_wallet):
                     if self._handle_successful_stake(message, user_wallet):
-                        self.bot.reply_to(message, "Stake verified! Your registration is confirmed.")
+                        success_message = (
+                            "✅ Stake verified! Your registration is confirmed.\n\n"
+                            "👥 Join the lobby by clicking here:\n"
+                            f"{Config.BASE_GROUP_INVITE_LINK}"
+                        )
+                        self.bot.reply_to(message, success_message)
                         return
                 else:
                     self.bot.reply_to(message, "You have not staked the required amount.")
@@ -171,7 +182,7 @@ class BattleOfTunesBot:
             user_id=message.from_user.id,
             username=message.from_user.username,
             wallet_address=wallet_address,
-            chat_id=Config.FIXED_CHAT_ID  # Use fixed chat ID instead of message.chat.id
+            chat_id=Config.FIXED_CHAT_ID
         )
         return success
 
