@@ -28,17 +28,23 @@ class ParticipantsDatabase:
     def _init_database(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        # Modified table schema to handle binary audio data
+
         cursor.execute('''
-        CREATE TABLE IF NOT EXISTS participants (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            wallet_address TEXT,
-            audio_file TEXT,
-            verified BOOLEAN DEFAULT 1,
-            battle_start_timestamp DATETIME,
-            battle_active BOOLEAN DEFAULT 0
-        )
+            CREATE TABLE IF NOT EXISTS participants (
+                user_id INTEGER,
+                username TEXT,
+                wallet_address TEXT,
+                audio_filename TEXT,
+                audio_data BLOB,
+                chat_id INTEGER,
+                verified BOOLEAN DEFAULT 1,
+                battle_start_timestamp DATETIME,
+                battle_active BOOLEAN DEFAULT 0,
+                PRIMARY KEY (user_id, chat_id)
+            )
         ''')
+
         conn.commit()
         conn.close()
 
@@ -69,12 +75,13 @@ class ParticipantsDatabase:
             finally:
                 conn.close()
 
-    def update_participant_audio(self, user_id, audio_file):
+    def update_participant_audio(self, user_id, audio_file_path):
+        """Update participant's audio with binary data from the file"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             try:
-                # First check if the participant exists
+                # Check if participant exists
                 cursor.execute('''
                 SELECT COUNT(*)
                 FROM participants
@@ -82,25 +89,58 @@ class ParticipantsDatabase:
                 ''', (user_id,))
 
                 if cursor.fetchone()[0] == 0:
-                    conn.close()
                     return False, "Participant not found"
 
+                # Read binary data from the audio file
+                with open(audio_file_path, 'rb') as audio_file:
+                    audio_data = audio_file.read()
+
+                # Update both audio data and filename
                 cursor.execute('''
                 UPDATE participants
-                SET audio_file = ?
+                SET audio_data = ?, audio_filename = ?
                 WHERE user_id = ?
-                ''', (audio_file, user_id))
+                ''', (audio_data, os.path.basename(audio_file_path), user_id))
+
                 conn.commit()
                 return True, "Audio file updated successfully"
             except sqlite3.Error as e:
                 logger.error(f"Database error: {e}")
                 return False, f"Database error: {str(e)}"
+            except IOError as e:
+                logger.error(f"File error: {e}")
+                return False, f"File error: {str(e)}"
+            finally:
+                conn.close()
+
+    def get_participant_audio(self, user_id):
+        """Retrieve audio data and filename for a participant"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                SELECT audio_data, audio_filename
+                FROM participants
+                WHERE user_id = ?
+                ''', (user_id,))
+                result = cursor.fetchone()
+                if result:
+                    return result[0], result[1]  # Returns (audio_data, filename)
+                return None, None
+            except sqlite3.Error as e:
+                logger.error(f"Database error: {e}")
+                return None, None
             finally:
                 conn.close()
 
 # Bot initialization and configuration
-BOT_TOKEN = '***********************************'
+BOT_TOKEN = '****************************'
 MUSIC_MODEL_API = '*******************************'
+TEMP_DIR = 'temp_audio'  # Directory for temporary audio files
+
+# Create temporary directory if it doesn't exist
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 bot = AsyncTeleBot(BOT_TOKEN)
 db_manager = ParticipantsDatabase()
@@ -176,8 +216,10 @@ async def generate_music(message):
                     # Decode base64 string to binary audio data
                     audio_binary = base64.b64decode(base64_audio)
 
+                    # Create a unique filename in the temporary directory
+                    audio_file_path = os.path.join(TEMP_DIR, f'generated_music_{message.from_user.id}_{int(asyncio.get_event_loop().time())}.mp3')
+
                     # Save the decoded audio to an MP3 file
-                    audio_file_path = f'generated_music_{message.from_user.id}.mp3'
                     with open(audio_file_path, 'wb') as f:
                         f.write(audio_binary)
 
@@ -219,12 +261,15 @@ async def handle_satisfaction(message):
     if message.text.lower() == 'submit':
         if message.from_user.id in user_last_audio:
             try:
+                # Store the audio file in the database
                 success, msg = db_manager.update_participant_audio(
                     user_id=message.from_user.id,
-                    audio_file=user_last_audio[message.from_user.id]
+                    audio_file_path=user_last_audio[message.from_user.id]
                 )
 
                 if success:
+                    # Clean up the temporary file after successful upload
+                    os.remove(user_last_audio[message.from_user.id])
                     await bot.send_message(
                         message.chat.id,
                         "Audio successfully submitted and recorded! 🎵",
@@ -253,15 +298,16 @@ async def handle_satisfaction(message):
                 reply_markup=ReplyKeyboardRemove()
             )
     elif message.text.lower() == 'no':
+        if message.from_user.id in user_last_audio:
+            # Clean up the temporary file
+            os.remove(user_last_audio[message.from_user.id])
+            del user_last_audio[message.from_user.id]
+
         await bot.send_message(
             message.chat.id,
             "No problem! Use /generate command again to create another music file.",
             reply_markup=ReplyKeyboardRemove()
         )
-        if message.from_user.id in user_last_audio:
-            os.remove(user_last_audio[message.from_user.id])
-            del user_last_audio[message.from_user.id]
-
         user_states[message.from_user.id] = None
     else:
         await bot.send_message(
