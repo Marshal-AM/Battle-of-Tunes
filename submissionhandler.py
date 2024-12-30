@@ -218,18 +218,15 @@ class ParticipantsDatabase:
                 conn.close()
 
     def reset_battle(self, chat_id):
-        """Reset battle state for a group"""
+        """Delete participants who were in the battle for a specific group"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
             try:
                 cursor.execute('''
-                    UPDATE participants
-                    SET battle_active = 0,
-                        audio_file = NULL,
-                        battle_start_timestamp = NULL
-                    WHERE chat_id = ?
+                    DELETE FROM participants
+                    WHERE chat_id = ? AND battle_active = 1
                 ''', (chat_id,))
                 conn.commit()
             except sqlite3.Error as e:
@@ -255,8 +252,7 @@ class SongBattleBot:
                 "I organize music creation battles where participants generate and compete with their AI-created tracks.\n\n"
                 "📜 How it works:\n"
                 "1. When there are 3 eligible participants, a battle automatically begins\n"
-                f"2. Participants use {AUDIO_GEN_BOT_USERNAME} to create their tracks\n"
-                "3. Once all tracks are submitted, they're evaluated and a winner is chosen\n\n"
+                "2. Once all tracks are submitted, they're evaluated and a winner is chosen\n\n"
                 "🎮 Commands:\n"
                 "/start - Show this information and current participants\n"
                 "/gentrack - Get the link to generate your track when in battle\n\n"
@@ -323,7 +319,7 @@ class SongBattleBot:
                     if chat_id in self.active_battles:
                         continue
 
-                    if len(participants) >= 3:
+                    if len(participants) >= 2:
                         valid_participants = []
                         for user_id, username, wallet in participants:
                             try:
@@ -333,7 +329,7 @@ class SongBattleBot:
                             except telebot.apihelper.ApiTelegramException:
                                 continue
 
-                        if len(valid_participants) == 3:
+                        if len(valid_participants) == 2:
                             user_ids = [p[0] for p in valid_participants]
                             if self.participants_db.activate_battle_for_users(user_ids, chat_id):
                                 self.active_battles.add(chat_id)
@@ -372,6 +368,19 @@ class SongBattleBot:
         try:
             while True:
                 if self.participants_db.check_all_participants_submitted(chat_id):
+                    # Send announcement that submissions are received
+                    await self.bot.send_message(
+                        chat_id,
+                        "🎵 All submissions received! 🎼\n\n"
+                        "Thank you for your entries! Your tracks will now be evaluated based on:\n"
+                        "• Musical quality\n"
+                        "• Energy levels\n"
+                        "• Danceability\n"
+                        "• Overall composition\n\n"
+                        "Please stand by for the results... 🎧"
+                    )
+
+                    # Proceed with evaluation
                     await self.submit_to_evaluation(chat_id)
                     return
                 await asyncio.sleep(10)
@@ -382,38 +391,102 @@ class SongBattleBot:
                 self.active_battles.remove(chat_id)
 
     async def submit_to_evaluation(self, chat_id):
-        """Submit to evaluation API using form-data format and display detailed results"""
+        """Submit to evaluation API using form-data format with MP3 files"""
         submissions = self.participants_db.get_participants_for_submission(chat_id)
+
+        logger.info(f"Starting evaluation submission for chat {chat_id}")
+        logger.info(f"Number of submissions received: {len(submissions)}")
 
         try:
             # Prepare form data
             form_data = aiohttp.FormData()
 
+            # Log submission details
+            logger.info("Preparing form data with the following submissions:")
+            for idx, submission in enumerate(submissions, 1):
+                logger.info(f"Submission {idx}:")
+                logger.info(f"  Wallet: {submission['wallet_address']}")
+                logger.info(f"  Audio data size: {len(submission['audio_file'])} bytes")
+
             # Add audio files first (in order)
             for idx, submission in enumerate(submissions):
-                audio_data = submission['audio_file']
-                form_data.add_field(f'audio_{idx + 1}',
-                                  audio_data,
-                                  filename=f'track{idx + 1}.mp3',
-                                  content_type='audio/mpeg')
+                # Get binary audio data from the submission
+                audio_data = submission['audio_file']  # This is the blob data from DB
+                field_name = f'audio_{idx + 1}'
+                filename = f'track{idx + 1}.mp3'
+
+                logger.info(f"Adding audio field: {field_name}")
+                logger.info(f"  Filename: {filename}")
+                logger.info(f"  Content type: audio/mpeg")
+
+                # Create a bytes object from the binary blob data
+                if isinstance(audio_data, memoryview):
+                    audio_bytes = audio_data.tobytes()
+                elif isinstance(audio_data, bytes):
+                    audio_bytes = audio_data
+                else:
+                    audio_bytes = bytes(audio_data)
+
+                # Add the audio data to the form
+                form_data.add_field(
+                    name=field_name,
+                    value=audio_bytes,
+                    filename=filename,
+                    content_type='audio/mpeg'
+                )
 
             # Add wallet addresses in the same order
             for idx, submission in enumerate(submissions):
-                form_data.add_field(f'wallet_{idx + 1}',
-                                  submission['wallet_address'])
+                field_name = f'wallet_{idx + 1}'
+                wallet = submission['wallet_address']
+
+                logger.info(f"Adding wallet field: {field_name}")
+                logger.info(f"  Wallet address: {wallet}")
+
+                form_data.add_field(field_name, wallet)
+
+            # Print form data contents for debugging
+            logger.info("\nFinal form data fields:")
+            for field in form_data._fields:
+                logger.info(f"Field name: {field[0]}")
+                logger.info(f"Content type: {field[2].get('content_type', 'text/plain')}")
+                if field[2].get('filename'):
+                    logger.info(f"Filename: {field[2]['filename']}")
+                logger.info("---")
+
+            logger.info("Making API call to evaluation endpoint...")
 
             # Submit to evaluation API
             async with aiohttp.ClientSession() as session:
-                async with session.post('https://music-evaluation.onrender.com/evaluate-tracks/',
-                                      data=form_data) as response:
+                logger.info("Starting API request to https://music-evaluation.onrender.com/evaluate-tracks/")
+
+                # Set a longer timeout for the API call since we're sending audio files
+                timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+
+                async with session.post(
+                    'https://music-evaluation.onrender.com/evaluate-tracks/',
+                    data=form_data,
+                    timeout=timeout
+                ) as response:
+                    logger.info(f"API Response Status: {response.status}")
+
                     if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"API Error Response: {error_text}")
                         raise Exception(f"API returned status code {response.status}")
+
+                    logger.info("Successfully received API response")
                     result = await response.json()
+                    logger.info("Successfully parsed JSON response")
 
             # Get winner details
             winner_wallet = result['winner_wallet']
             winning_track = result['winning_track']
             winning_score = result['score']
+
+            logger.info(f"Winner determined - Wallet: {winner_wallet}")
+            logger.info(f"Winning track: {winning_track}")
+            logger.info(f"Winning score: {winning_score}")
 
             # Format rankings message
             rankings_message = "🎵 Battle Results 🎵\n\n"
@@ -423,6 +496,7 @@ class SongBattleBot:
             rankings_message += f"🕒 Battle completed at: {battle_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
             # Add rankings
+            participants = self.participants_db.get_participants(chat_id)
             for idx, ranking in enumerate(result['all_rankings'], 1):
                 wallet = ranking['wallet_address']
                 score = ranking['quality_score']
@@ -455,6 +529,8 @@ class SongBattleBot:
                 for idx, diff in enumerate(result['score_differences'], 1):
                     rankings_message += f"#{idx+1} vs #{idx}: {diff:.3f} points\n"
 
+            logger.info("Sending results message to chat")
+
             # Send results
             await self.bot.send_message(
                 chat_id=chat_id,
@@ -462,18 +538,22 @@ class SongBattleBot:
                 parse_mode='HTML'
             )
 
-            # Reset battle
+            logger.info("Results message sent successfully")
+
+            # Delete the participants who were in this battle
+            logger.info("Resetting battle state")
             self.participants_db.reset_battle(chat_id)
             del self.evaluation_tasks[chat_id]
+            logger.info("Battle reset completed")
 
         except Exception as e:
             logger.error(f"Evaluation error for group {chat_id}: {e}")
+            logger.exception("Full exception details:")
             await self.bot.send_message(
                 chat_id=chat_id,
                 text="⚠️ An error occurred during battle evaluation. Please try again later."
             )
 
-    # [Rest of the code remains the same...]
 
     async def run(self):
         """Run the bot with battle checking"""
