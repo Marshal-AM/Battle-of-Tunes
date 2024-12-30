@@ -6,17 +6,32 @@ import sqlite3
 import threading
 
 # Telegram Bot Token
-BOT_TOKEN = "*****************************"
+BOT_TOKEN = "***************************"
 bot = telebot.TeleBot(BOT_TOKEN)
-STAKE_PAGE_URL = "*************************"
+STAKE_PAGE_URL = "******************************"
 
 # Web3 Configuration
 WEB3_PROVIDER = "https://data-seed-prebsc-1-s1.binance.org:8545"
 CONTRACT_ADDRESS = "0x242c0c356cbaea0e1a80a574f1d3571a0babe772"
-CONTRACT_ABI = [{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"FundsSent","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Staked","type":"event"},{"inputs":[],"name":"STAKE_AMOUNT","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address payable","name":"recipient","type":"address"}],"name":"sendFundsTo","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"stake","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+CONTRACT_ABI = [
+    {
+        "inputs": [],
+        "name": "stake",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "verifyStake",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+]
 
 class ParticipantsDatabase:
-    def __init__(self, db_path='song_battle_participants.db'):
+    def __init__(self, db_path='/content/drive/MyDrive/BattleOfTunes/song_battle_participants.db'):
         self.db_path = db_path
         self._lock = threading.Lock()
         self._init_database()
@@ -27,22 +42,20 @@ class ParticipantsDatabase:
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # Participants table with group-specific fields
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS participants (
-        user_id INTEGER,
-        username TEXT,
-        wallet_address TEXT,
-        audio_file TEXT,
-        chat_id INTEGER,
-        verified BOOLEAN DEFAULT 1,
-        battle_start_timestamp DATETIME,
-        battle_active BOOLEAN DEFAULT 0,
-        PRIMARY KEY (user_id, chat_id)
+            user_id INTEGER,
+            username TEXT,
+            wallet_address TEXT,
+            audio_file TEXT,
+            chat_id INTEGER,
+            verified BOOLEAN DEFAULT 1,
+            battle_start_timestamp DATETIME,
+            battle_active BOOLEAN DEFAULT 0,
+            PRIMARY KEY (user_id, chat_id)
         )
         ''')
-        
-        # Create a table for invite links if not exists
+
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS invite_links (
             wallet_address TEXT PRIMARY KEY,
@@ -50,31 +63,28 @@ class ParticipantsDatabase:
             used BOOLEAN DEFAULT 0
         )
         ''')
-        
+
         conn.commit()
         conn.close()
 
-    def add_verified_participant(self, wallet_address, user_id=None, username=None, chat_id=None):
+    def update_participant_info(self, user_id, username, wallet_address, chat_id):
         """
-        Add a verified participant to the database.
+        Update or insert participant information including username and wallet address.
+        Sets audio_file to None for new entries.
         """
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             try:
-                # Remove any existing entries for this wallet
-                cursor.execute('''
-                DELETE FROM participants
-                WHERE wallet_address = ?
-                ''', (wallet_address,))
-                
-                # Insert new participant entry
                 cursor.execute('''
                 INSERT INTO participants
-                (user_id, username, wallet_address, chat_id, verified)
-                VALUES (?, ?, ?, ?, 1)
+                (user_id, username, wallet_address, chat_id, audio_file, verified)
+                VALUES (?, ?, ?, ?, NULL, 1)
+                ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                username = COALESCE(excluded.username, username),
+                wallet_address = COALESCE(excluded.wallet_address, wallet_address),
+                verified = 1
                 ''', (user_id, username, wallet_address, chat_id))
-                
                 conn.commit()
                 return True
             except sqlite3.Error as e:
@@ -91,13 +101,11 @@ class ParticipantsDatabase:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             try:
-                # Insert or replace the record for this wallet
                 cursor.execute('''
-                    INSERT OR REPLACE INTO invite_links 
-                    (wallet_address, invite_link, used) 
+                    INSERT OR REPLACE INTO invite_links
+                    (wallet_address, invite_link, used)
                     VALUES (?, ?, 0)
                 ''', (wallet_address, invite_link))
-                
                 conn.commit()
                 return True
             except sqlite3.Error as e:
@@ -113,40 +121,32 @@ web3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER))
 contract = web3.eth.contract(address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=CONTRACT_ABI)
 
 # Base group invite link
-BASE_GROUP_INVITE_LINK = "https://t.me/+ImTq8tu-h_82N2Y9"
+BASE_GROUP_INVITE_LINK = "https://t.me/+NxOSoOVa-BUwYWVl"
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    welcome_message = (
+        "Welcome to Battle of Tunes! 🎵\n\n"
+        "Available commands:\n"
+        "/stake <wallet_address> - Start the staking process to participate\n"
+        "/verify <wallet_address> - Verify your existing stake and get group invite\n\n"
+        "To participate in Battle of Tunes, you'll need to stake first. Use the /stake command followed by your wallet address to begin!"
+    )
+    bot.reply_to(message, welcome_message)
 
 def generate_one_time_invite_link(wallet_address):
-    """
-    Generate a unique one-time invite link for a verified staker.
-    """
-    # Generate a cryptographically secure random token
     unique_token = secrets.token_urlsafe(16)
-    
-    # Construct the one-time invite link
     one_time_link = f"{BASE_GROUP_INVITE_LINK}?start={unique_token}"
-    
-    # Store the link in the database
     db_manager.add_invite_link(wallet_address, one_time_link)
-    
     return one_time_link
 
 def verify_and_get_invite_link(wallet_address):
-    """
-    Verify stake and generate or retrieve a one-time invite link.
-    """
-    # First, verify the stake
     if not verify_stake(wallet_address):
         return None
-    
-    # Generate or retrieve the one-time invite link
     return generate_one_time_invite_link(wallet_address)
 
 def verify_stake(user_wallet):
-    """
-    Verifies if the user has staked the required amount by calling the contract function.
-    """
     try:
-        # Call the verifyStake function from the smart contract
         return contract.functions.verifyStake(user_wallet).call()
     except Exception as e:
         print(f"Error verifying stake: {e}")
@@ -154,11 +154,7 @@ def verify_stake(user_wallet):
 
 @bot.message_handler(commands=['stake'])
 def stake_handler(message):
-    """
-    Handle stake command to generate staking transaction link.
-    """
     try:
-        # Split command and address
         command_parts = message.text.split()
         if len(command_parts) != 2:
             bot.reply_to(message, "Usage: /stake <wallet_address>")
@@ -169,28 +165,24 @@ def stake_handler(message):
             bot.reply_to(message, "Invalid wallet address. Please provide a valid address.")
             return
 
-        # Generate staking transaction link
         stake_link = f"{STAKE_PAGE_URL}?wallet={user_wallet}&amount=0.0002"
-
-        # Send the link to the user
         bot.reply_to(message, f"Please complete your staking by visiting the link below:\n\n{stake_link}")
-
-        # Wait and verify staking status
         bot.reply_to(message, "Waiting for transaction confirmation...")
 
-        # Retry check every 10 seconds for 3 minutes
-        for _ in range(18):  # 18 attempts (10 seconds each)
+        for _ in range(18):
             has_staked = verify_stake(user_wallet)
             if has_staked:
-                # Add verified participant to the database
-                db_manager.add_verified_participant(
-                    wallet_address=user_wallet,
+                success = db_manager.update_participant_info(
                     user_id=message.from_user.id,
                     username=message.from_user.username,
+                    wallet_address=user_wallet,
                     chat_id=message.chat.id
                 )
-                
-                # Generate one-time invite link
+
+                if not success:
+                    bot.reply_to(message, "Error updating participant information.")
+                    return
+
                 invite_link = verify_and_get_invite_link(user_wallet)
                 if invite_link:
                     bot.reply_to(
@@ -209,11 +201,7 @@ def stake_handler(message):
 
 @bot.message_handler(commands=['verify'])
 def verify_stake_handler(message):
-    """
-    Directly verify stake and generate one-time invite link if verified.
-    """
     try:
-        # Split command and address
         command_parts = message.text.split()
         if len(command_parts) != 2:
             bot.reply_to(message, "Usage: /verify <wallet_address>")
@@ -224,19 +212,19 @@ def verify_stake_handler(message):
             bot.reply_to(message, "Invalid wallet address. Please provide a valid address.")
             return
 
-        # Verify stake
         if verify_stake(user_wallet):
-            # Add verified participant to the database
-            db_manager.add_verified_participant(
-                wallet_address=user_wallet,
+            success = db_manager.update_participant_info(
                 user_id=message.from_user.id,
                 username=message.from_user.username,
+                wallet_address=user_wallet,
                 chat_id=message.chat.id
             )
 
-            # Generate one-time invite link
+            if not success:
+                bot.reply_to(message, "Error updating participant information.")
+                return
+
             invite_link = verify_and_get_invite_link(user_wallet)
-            
             if invite_link:
                 bot.reply_to(
                     message,
@@ -249,7 +237,6 @@ def verify_stake_handler(message):
     except Exception as e:
         bot.reply_to(message, f"An error occurred: {str(e)}")
 
-# Run the bot
 if __name__ == "__main__":
     print("Bot is running...")
     bot.polling()
