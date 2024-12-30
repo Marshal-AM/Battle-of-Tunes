@@ -7,6 +7,7 @@ import aiohttp
 import nest_asyncio
 import base64
 from telebot.async_telebot import AsyncTeleBot
+from telebot import types
 from telebot.types import ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 # Logging setup
@@ -101,8 +102,8 @@ class ParticipantsDatabase:
                 conn.close()
 
 # Replace with your actual configurations
-BOT_TOKEN = '******************************'
-MUSIC_MODEL_API = '*****************************'
+BOT_TOKEN = '*****************************'
+MUSIC_MODEL_API = '*************************************'
 
 # Initialize the Telegram Bot and Database
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -196,8 +197,8 @@ async def generate_music(message):
 
                     # Ask for satisfaction with submit option
                     satisfaction_markup = ReplyKeyboardMarkup(row_width=2)
-                    submit_button = telebot.types.KeyboardButton('Submit')
-                    no_button = telebot.types.KeyboardButton('No')
+                    submit_button = types.KeyboardButton('Submit')
+                    no_button = types.KeyboardButton('No')
                     satisfaction_markup.add(submit_button, no_button)
 
                     await bot.send_message(
@@ -284,8 +285,6 @@ async def about_bot(message):
 async def handle_other_messages(message):
     await bot.reply_to(message, "Please use /generate to create music or /about to learn more about the bot.")
 
-# Replace the last part of your code (the main execution part) with this:
-
 async def main():
     print("Bot is running...")
     try:
@@ -296,5 +295,4 @@ async def main():
         await main()
 
 if __name__ == '__main__':
-    # Simple execution that works in both Jupyter and regular Python
     asyncio.run(main())
