@@ -108,7 +108,7 @@ Our game is managed through three specialized Telegram bots:
 
 ### Smart Contract
 
-- A BSC Testnet smart contract handles staking and prize distribution.
+- A contract deployed on the BSC testnet handles staking and prize distribution.
 
 Contract address: 0xA546819d48330FB2E02D3424676d13D7B8af3bB2
 
